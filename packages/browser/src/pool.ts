@@ -1,4 +1,5 @@
 import type { BrowserHandle, PoolBrowser, PoolStats } from "@trawl/types"
+import { execSync } from "node:child_process"
 import { Camoufox } from "camoufox-js"
 import { FINGERPRINT_POOL } from "./fingerprint"
 
@@ -28,6 +29,7 @@ interface PoolEntry extends PoolBrowser {
   temporaryContextUses: number
   restartReason?: string
   restarting?: boolean
+  consecutiveFailures?: number
   fingerprint: (typeof FINGERPRINT_POOL)[number]
 }
 
@@ -261,7 +263,7 @@ export class BrowserPool {
 
   private async runHealthCheck(): Promise<void> {
     for (const entry of this.entries) {
-      if (entry.busy) continue
+      if (entry.busy || entry.restarting) continue
       if (!(entry.browser?.isConnected() ?? false)) {
         console.warn(`[pool] browser ${entry.id} disconnected, restarting`)
         await this.restartEntry(entry, "browser disconnected")
@@ -269,6 +271,15 @@ export class BrowserPool {
         entry.healthy = true
       }
     }
+  }
+
+  private killZombieCamoufox(): void {
+    // Kill leftover Camoufox processes that may become zombies after a failed
+    // launch. Synchronous pkill is acceptable here — we're already in a
+    // restart-failure path and the event loop is blocked anyway.
+    try {
+      execSync('pkill -9 -f camoufox-bin 2>/dev/null || true', { stdio: "ignore" })
+    } catch {}
   }
 
   private async restartEntry(entry: PoolEntry, reason = "manual restart"): Promise<void> {
@@ -288,22 +299,38 @@ export class BrowserPool {
     } catch {}
     entry.browser = null
     entry.context = null
-    try {
-      // On restart, keep the entry's original fingerprint so this browser instance
-      // keeps its identity across restart cycles (otherwise cross-session correlation
-      // becomes trivial).
-      const { browser, context } = await this.launchBrowser(entry.fingerprint)
-      entry.browser = browser
-      entry.context = context
-      entry.healthy = true
-      entry.temporaryContextUses = 0
-      entry.restartCount++
-      console.log(`[pool] browser ${entry.id} restarted (total: ${entry.restartCount})`)
-    } catch (err) {
-      console.error(`[pool] browser ${entry.id} failed to restart:`, err)
-    } finally {
-      entry.restarting = false
+
+    const MAX_ATTEMPTS = 3
+    const BASE_DELAY_MS = 5_000
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        const { browser, context } = await this.launchBrowser(entry.fingerprint)
+        entry.browser = browser
+        entry.context = context
+        entry.healthy = true
+        entry.temporaryContextUses = 0
+        entry.restartCount++
+        entry.consecutiveFailures = 0
+        console.log(`[pool] browser ${entry.id} restarted (total: ${entry.restartCount}, attempt: ${attempt})`)
+        entry.restarting = false
+        return
+      } catch (err) {
+        console.error(`[pool] browser ${entry.id} restart attempt ${attempt}/${MAX_ATTEMPTS} failed:`, err)
+        this.killZombieCamoufox()
+        if (attempt < MAX_ATTEMPTS) {
+          const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1)
+          console.warn(`[pool] browser ${entry.id} backing off ${delay}ms before retry`)
+          await new Promise((r) => setTimeout(r, delay))
+        }
+      }
     }
+
+    // All attempts exhausted — mark unhealthy and unlock restarting.
+    // Health check will retry on next cycle (30s) — exponential backoff
+    // prevents the tight restart loop that caused the original deadlock.
+    entry.consecutiveFailures = (entry.consecutiveFailures ?? 0) + 1
+    entry.restarting = false
+    console.error(`[pool] browser ${entry.id} exhausted ${MAX_ATTEMPTS} restart attempts, marking unhealthy (consecutive: ${entry.consecutiveFailures})`)
   }
 
   getStats(): PoolStats {
