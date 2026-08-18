@@ -2,6 +2,7 @@ import type { BrowserHandle, PoolBrowser, PoolStats } from "@trawl/types"
 import { execSync } from "node:child_process"
 import { Camoufox } from "camoufox-js"
 import { FINGERPRINT_POOL } from "./fingerprint"
+import { toPlaywrightProxy } from "./proxy"
 
 // camoufox-js wraps Playwright but doesn't re-export Browser/BrowserContext types.
 // The pool accepts any structurally-compatible browser (Playwright OR patchright) —
@@ -11,6 +12,40 @@ import { FINGERPRINT_POOL } from "./fingerprint"
 type Browser = any
 // biome-ignore lint/suspicious/noExplicitAny: see comment above
 type BrowserContext = any
+
+// Closing a Camoufox browser or context can hang indefinitely when a content process is
+// wedged — tier3/tier4 already guard their temporary contexts this way. 10s is far above
+// the typical sub-second close path.
+const CLOSE_TIMEOUT_MS = 10_000
+// A cold Camoufox start is a few seconds; camoufox-js also does a public-IP lookup for
+// `geoip` before handing off to Playwright, which adds network time that Playwright's own
+// launch timeout does not cover. 90s is generous but finite.
+const LAUNCH_TIMEOUT_MS = 90_000
+
+type AsyncAction = () => unknown | Promise<unknown>
+
+const settle = (action: AsyncAction): Promise<void> =>
+  Promise.resolve()
+    .then(action)
+    .then(
+      () => {},
+      () => {},
+    )
+
+// Invoking the action inside the promise chain catches synchronous throws too.
+const settleWithin = (action: AsyncAction | undefined, ms: number): Promise<void> => {
+  if (!action) return Promise.resolve()
+  const swallowed = settle(action)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([
+    swallowed,
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, ms)
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
+}
 
 export class PoolExhaustedError extends Error {
   constructor() {
@@ -24,12 +59,20 @@ export class PoolExhaustedError extends Error {
 export type { BrowserHandle } from "@trawl/types"
 
 interface PoolEntry extends PoolBrowser {
-  browser: Browser | null
-  context: BrowserContext | null
+  lease: number
+  browser?: Browser
+  context?: BrowserContext
   temporaryContextUses: number
+  // Page closes started by release(); restartEntry lets them settle before tearing the
+  // context down, so it isn't closing a context underneath in-flight page.close() calls.
+  pendingPageCloses?: Promise<unknown>
+  // Wall-clock instant past which this checkout is considered wedged. Set on acquire from
+  // the caller's budget; undefined when idle.
+  stallAt?: number
   restartReason?: string
   restarting?: boolean
   consecutiveFailures?: number
+  replacementRequested?: string
   fingerprint: (typeof FINGERPRINT_POOL)[number]
 }
 
@@ -42,8 +85,16 @@ export class BrowserPool {
   private pollIntervalMs: number
   private recycleAfterTemporaryContexts: number
   private contentProcesses!: number
+  private stallAfterMs: number
+  private closeTimeoutMs: number
+  private launchTimeoutMs: number
+  private healthIntervalMs: number
   private browserFactory?: BrowserFactory
-  private healthInterval: ReturnType<typeof setInterval> | null = null
+  private healthInterval?: ReturnType<typeof setInterval>
+  private abandonedLaunches = 0
+  private maxAbandonedLaunches: number
+  private replacementRunning = false
+  private shuttingDown = false
 
   constructor({
     poolSize,
@@ -51,6 +102,11 @@ export class BrowserPool {
     pollIntervalMs = 100,
     recycleAfterTemporaryContexts = 8,
     contentProcesses = 2,
+    stallAfterMs = 180_000,
+    closeTimeoutMs = CLOSE_TIMEOUT_MS,
+    launchTimeoutMs = LAUNCH_TIMEOUT_MS,
+    healthIntervalMs = 30_000,
+    maxAbandonedLaunches = 3,
     browserFactory,
   }: {
     poolSize: number
@@ -58,6 +114,11 @@ export class BrowserPool {
     pollIntervalMs?: number
     recycleAfterTemporaryContexts?: number
     contentProcesses?: number
+    stallAfterMs?: number
+    closeTimeoutMs?: number
+    launchTimeoutMs?: number
+    healthIntervalMs?: number
+    maxAbandonedLaunches?: number
     browserFactory?: BrowserFactory
   }) {
     this.poolSize = poolSize
@@ -65,19 +126,40 @@ export class BrowserPool {
     this.pollIntervalMs = pollIntervalMs
     this.recycleAfterTemporaryContexts = recycleAfterTemporaryContexts
     this.contentProcesses = contentProcesses
+    this.stallAfterMs = stallAfterMs
+    this.closeTimeoutMs = closeTimeoutMs
+    this.launchTimeoutMs = launchTimeoutMs
+    this.healthIntervalMs = healthIntervalMs
+    this.maxAbandonedLaunches = maxAbandonedLaunches
     this.browserFactory = browserFactory
   }
 
+  // A checkout past its deadline is not slow, it's wedged. The deadline is the caller's
+  // own budget (req.maxTimeout) plus a full stallAfterMs of grace, so a request is never
+  // reclaimed while it is still inside the time it asked for — callers may legitimately
+  // pass a maxTimeout larger than stallAfterMs. Without a budget we fall back to
+  // stallAfterMs alone.
+  private isStalled(entry: PoolEntry, now = Date.now()): boolean {
+    if (!entry.busy || entry.stallAt === undefined) return false
+    return now > entry.stallAt
+  }
+
   async init(): Promise<void> {
-    for (let i = 0; i < this.poolSize; i++) {
+    if (this.poolSize <= 0) return
+
+    const launch = async (i: number) => {
       // Pick a fingerprint for this instance; the picked OS drives the browser's
       // navigator.platform, locale, timezone, and the HTTP UA the orchestrator sends.
       // Shuffled pool (not sequential) so 4 browsers don't all get the same fingerprint.
       const fingerprint = FINGERPRINT_POOL[i % FINGERPRINT_POOL.length]
-      const { browser, context } = await this.launchBrowser(fingerprint)
+      // Bounded like every other launch: an unbounded hang here leaves init() pending
+      // forever with the HTTP listener already up, so the pod never becomes ready and
+      // never fails either. Throwing lets the startup probe restart the container.
+      const { browser, context } = await this.launchWithin(fingerprint, this.launchTimeoutMs)
       this.entries.push({
         id: i,
         busy: false,
+        lease: 0,
         restartCount: 0,
         healthy: true,
         browser,
@@ -86,6 +168,27 @@ export class BrowserPool {
         fingerprint,
       })
       console.log(`[pool] browser ${i + 1}/${this.poolSize} ready (UA=${fingerprint.platform})`)
+    }
+
+    // Camoufox performs one-time shared addon setup during its first launch; racing
+    // that setup can expose a half-extracted addon to sibling launches. Publish the
+    // first browser immediately, then warm the remaining capacity concurrently.
+    try {
+      await launch(0)
+    } catch (error) {
+      await this.shutdown()
+      throw error
+    }
+
+    const launches = Array.from({ length: Math.max(0, this.poolSize - 1) }, (_, i) => launch(i + 1))
+
+    const results = await Promise.allSettled(launches)
+    const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected")
+    if (failure) {
+      // Successful siblings were published progressively. Close them before
+      // surfacing a failed startup so tests and supervised restarts do not leak.
+      await this.shutdown()
+      throw failure.reason
     }
   }
 
@@ -139,12 +242,47 @@ export class BrowserPool {
       // + browser-side Intl locale all align.
       locale: fingerprint.locale,
       timezone: fingerprint.timezone,
-      // Cap content processes per browser. Firefox's default (8) lets thread count climb
-      // when Tier 3/Tier 4 churn contexts (see #13). Lower cap → bounded OS footprint.
-      // `processPrelaunch: false` stops Firefox from pre-warming extra processes eagerly.
-      prefs: {
+      // Camoufox 150.x managed-mode relies on `firefox_user_prefs` (Playwright
+      // maps this to firefoxUserPrefs). The earlier `prefs` key was silently
+      // ignored, so these settings were dead code in 1.0.0.
+      firefox_user_prefs: {
         "dom.ipc.processCount": this.contentProcesses,
         "dom.ipc.processPrelaunch": false,
+        "dom.ipc.contentProcessCount": this.contentProcesses,
+
+        // Telemetry
+        "datareporting.healthreport.uploadEnabled": false,
+        "datareporting.policy.dataSubmissionEnabled": false,
+        "datareporting.policy.dataSubmissionURL": "",
+        "toolkit.telemetry.enabled": false,
+        "toolkit.telemetry.unified": false,
+        "toolkit.telemetry.archive": false,
+        "toolkit.telemetry.updatePing.enabled": false,
+        "app.crashreporter": false,
+        "breakpad.reportURL": "",
+        "breakpad.submitReportURL": "",
+
+        // Disabled Firefox services — not used in headless scraping
+        "browser.safebrowsing.downloads.enabled": false,
+        "browser.safebrowsing.malware.enabled": false,
+        "extensions.update.enabled": false,
+        "extensions.systemAddon.update.url": "",
+        "browser.fixup.alternate.enabled": false,
+        "app.normandy.enabled": false,
+        "app.shield.optoutstudies.enabled": false,
+        "network.connectivity-service.enabled": false,
+        "network.captive-portal-service.enabled": false,
+        "network.prefetch-next": false,
+        "beacon.enabled": false,
+        "security.OCSP.enabled": 0,
+        "network.http.tls-handshake-timeout": 30,
+        "network.http.connection-timeout": 60,
+        "network.http.response.timeout": 120,
+
+        // UI chrome features a scraper never sees
+        "extensions.screenshots.system.enabled": false,
+        "extensions.screenshots.background.enabled": false,
+        "browser.sessionstore.max_tabs_undo": 0,
       },
     })
 
@@ -174,8 +312,7 @@ export class BrowserPool {
       const _attachShadow = Element.prototype.attachShadow
       Element.prototype.attachShadow = function (init: ShadowRootInit) {
         const shadowRoot = _attachShadow.call(this, init)
-        // biome-ignore lint/suspicious/noExplicitAny: extending DOM element with custom property
-        ;(this as any).shadowRootUnl = shadowRoot
+        Object.defineProperty(this, "shadowRootUnl", { configurable: true, value: shadowRoot })
         return shadowRoot
       }
     })
@@ -183,23 +320,38 @@ export class BrowserPool {
     return context
   }
 
-  acquire(domain?: string): Promise<BrowserHandle> {
+  // `budgetMs` is the caller's own deadline for this checkout (the orchestrator passes
+  // req.maxTimeout). It only ever extends how long the checkout is tolerated, never
+  // shortens it below stallAfterMs.
+  acquire(domain?: string, budgetMs?: number): Promise<BrowserHandle> {
     return new Promise((resolve, reject) => {
       const tryAcquire = () => {
         const entry = this.pickEntry(domain)
         if (!entry) return false
         if (!entry.context || !entry.browser) return false
+        const now = Date.now()
         entry.busy = true
+        entry.busySince = now
+        entry.stallAt = now + Math.max(budgetMs ?? 0, 0) + this.stallAfterMs
+        entry.lease++
         entry.lastDomain = domain
         entry.lastUsedAt = Date.now()
         resolve({
           id: entry.id,
+          lease: entry.lease,
           context: entry.context,
           browser: entry.browser,
           fingerprint: entry.fingerprint,
-          noteTemporaryContext: (reason: string) => {
-            this.noteTemporaryContext(entry, reason)
-          },
+          // Captured lease: a reclaimed request that resumes later must not attribute its
+          // failure to the replacement browser now occupying this entry.
+          noteTemporaryContext: ((lease: number) => () => {
+            if (entry.lease !== lease) return
+            this.noteTemporaryContext(entry)
+          })(entry.lease),
+          requestBrowserReplacement: ((lease: number) => (reason: string) => {
+            if (entry.lease !== lease) return
+            this.requestRollingReplacement(entry, reason)
+          })(entry.lease),
         })
         return true
       }
@@ -220,9 +372,9 @@ export class BrowserPool {
     })
   }
 
-  private pickEntry(domain?: string): PoolEntry | null {
+  private pickEntry(domain?: string): PoolEntry | undefined {
     const available = this.entries.filter((e) => !e.busy && !e.restarting && e.healthy && e.context)
-    if (available.length === 0) return null
+    if (available.length === 0) return
     if (domain) {
       const sticky = available.find((e) => e.lastDomain === domain)
       if (sticky) return sticky
@@ -230,47 +382,204 @@ export class BrowserPool {
     return available[0]
   }
 
-  private noteTemporaryContext(entry: PoolEntry, reason: string): void {
+  private noteTemporaryContext(entry: PoolEntry): void {
     if (this.recycleAfterTemporaryContexts <= 0) return
-    // Skip if the entry is already being recycled — avoids incrementing the counter
-    // against a dead entry and racing with the in-flight restartEntry.
-    if (entry.restarting) return
-
     entry.temporaryContextUses++
     if (entry.temporaryContextUses >= this.recycleAfterTemporaryContexts) {
-      entry.restartReason = `${reason}; ${entry.temporaryContextUses} temporary contexts used`
+      this.requestRollingReplacement(entry, `${entry.temporaryContextUses} temporary contexts created`)
     }
   }
 
-  release(id: number): void {
+  private requestRollingReplacement(entry: PoolEntry, reason: string): void {
+    if (entry.restarting) return
+    entry.replacementRequested ??= reason
+    if (!entry.busy) void this.runNextRollingReplacement()
+  }
+
+  // Periodic recycling is rolling: the existing browser remains usable while its
+  // replacement starts. A pool-wide lock bounds the temporary peak to one browser.
+  private async runNextRollingReplacement(): Promise<void> {
+    if (this.replacementRunning || this.shuttingDown) return
+    const entry = this.entries.find((candidate) => candidate.replacementRequested && !candidate.restarting)
+    if (!entry) return
+    this.replacementRunning = true
+    const reason = entry.replacementRequested as string
+    entry.replacementRequested = undefined
+    console.warn(`[pool] browser ${entry.id} warming replacement: ${reason}`)
+
+    let replacement: { browser: Browser; context: BrowserContext } | undefined
+    try {
+      if (this.abandonedLaunches >= this.maxAbandonedLaunches) {
+        throw new Error(`${this.abandonedLaunches} launches already abandoned; not starting another until one settles`)
+      }
+      replacement = await this.launchWithin(entry.fingerprint, this.launchTimeoutMs)
+
+      // Acquires continue during the launch. Wait to swap until the current lease is
+      // released, without marking the entry unavailable in the meantime.
+      while (entry.busy && !this.shuttingDown) {
+        await new Promise((resolve) => setTimeout(resolve, this.pollIntervalMs))
+      }
+      if (this.shuttingDown) return
+
+      const retiredBrowser = entry.browser
+      const retiredContext = entry.context
+      const pendingPageCloses = entry.pendingPageCloses
+      entry.browser = replacement.browser
+      entry.context = replacement.context
+      replacement = undefined
+      entry.pendingPageCloses = undefined
+      entry.temporaryContextUses = 0
+      // Contexts created while this replacement was warming belong to the browser
+      // being retired. They may have re-asserted the threshold request, but the new
+      // browser starts clean and must not immediately replace itself again.
+      entry.replacementRequested = undefined
+      entry.restartCount++
+      entry.healthy = true
+      entry.lease++
+      console.log(`[pool] browser ${entry.id} rolling replacement installed (total: ${entry.restartCount})`)
+
+      await settleWithin(pendingPageCloses ? () => pendingPageCloses : undefined, this.closeTimeoutMs)
+      await settleWithin(() => retiredContext?.close(), this.closeTimeoutMs)
+      await settleWithin(() => retiredBrowser?.close(), this.closeTimeoutMs)
+    } catch (err) {
+      // A failed warm-up never disturbs the browser currently serving the entry.
+      entry.replacementRequested ??= reason
+      console.error(`[pool] browser ${entry.id} failed to warm replacement:`, err)
+    } finally {
+      if (replacement) {
+        await settleWithin(() => replacement?.context?.close(), this.closeTimeoutMs)
+        await settleWithin(() => replacement?.browser?.close(), this.closeTimeoutMs)
+      }
+      this.replacementRunning = false
+      // Do not spin immediately on a failed launch. Health checks and subsequent
+      // releases provide bounded retry opportunities.
+      const next = this.entries.find((candidate) => candidate.replacementRequested && candidate !== entry)
+      if (next) void this.runNextRollingReplacement()
+    }
+  }
+
+  release(id: number, lease?: number): void {
     const entry = this.entries.find((e) => e.id === id)
     if (!entry) return
+    // A checkout the health check already reclaimed must not free the entry a second
+    // time — by now it may be restarting, or handed to a different request. The lease
+    // identifies *which* checkout is being released; a mismatch means this one is stale.
+    if (lease !== undefined && entry.lease !== lease) return
+    if (!entry.busy) return
     entry.busy = false
+    entry.busySince = undefined
+    entry.stallAt = undefined
     // Keep the context alive — CF cookies (cf_clearance, __cf_bm) and browser cache
     // accumulate, making subsequent challenges faster. Cookies are domain-scoped.
-    if (entry.context) {
-      const pages: unknown[] = entry.context.pages() ?? []
-      for (const p of pages) (p as { close: () => Promise<void> }).close().catch(() => {})
-    }
+    let pages: { close: AsyncAction }[] = []
+    try {
+      pages = entry.context?.pages() ?? []
+    } catch {}
+    entry.pendingPageCloses = Promise.all(pages.map((page) => settle(() => page.close())))
     if (entry.restartReason) {
-      void this.restartEntry(entry, entry.restartReason)
+      const reason = entry.restartReason
+      entry.restartReason = undefined
+      // Called synchronously, not deferred behind the page closes: restartEntry sets
+      // `restarting` before its first await, and that flag is what stops another request
+      // acquiring this entry in the window before the browser is actually torn down.
+      // restartEntry waits on pendingPageCloses itself.
+      void this.restartEntry(entry, reason)
+    } else if (entry.replacementRequested) {
+      void this.runNextRollingReplacement()
     }
   }
 
   startHealthCheck(): void {
-    this.healthInterval = setInterval(() => this.runHealthCheck(), 30_000)
+    this.healthInterval = setInterval(() => this.runHealthCheck(), this.healthIntervalMs)
   }
 
   private async runHealthCheck(): Promise<void> {
+    const now = Date.now()
     for (const entry of this.entries) {
-      if (entry.busy || entry.restarting) continue
+      // A restart already in flight will finish or fail on its own deadline. Re-entering
+      // here only produced the "disconnected, restarting" log every 30s that made a dead
+      // pool look like a busy one.
+      if (entry.restarting) continue
+
+      if (entry.busy) {
+        // We can't probe a checked-out browser — closing it would kill a live request.
+        // But a checkout past the stall threshold is not a request any more: it never
+        // reached the orchestrator's `finally`, so nothing will ever release it. Left
+        // alone, the entry is subtracted from the pool for the rest of the process.
+        if (this.isStalled(entry, now)) {
+          const heldSec = Math.round((now - (entry.busySince ?? now)) / 1000)
+          console.warn(`[pool] browser ${entry.id} stalled — checked out for ${heldSec}s, reclaiming`)
+          await this.restartEntry(entry, "checkout stalled")
+        }
+        continue
+      }
+
       if (!(entry.browser?.isConnected() ?? false)) {
         console.warn(`[pool] browser ${entry.id} disconnected, restarting`)
         await this.restartEntry(entry, "browser disconnected")
       } else {
         entry.healthy = true
+        if (entry.replacementRequested) void this.runNextRollingReplacement()
       }
     }
+  }
+
+// Runs `launchBrowser` under a hard deadline. Playwright's own launch timeout does not
+  // cover camoufox-js's pre-launch work (the `geoip` public-IP lookup), so a launch can
+  // outlive it; and an unbounded launch here is unrecoverable — see restartEntry.
+  private async launchWithin(
+    fingerprint: (typeof FINGERPRINT_POOL)[number],
+    ms: number,
+  ): Promise<{ browser: Browser; context: BrowserContext }> {
+    let timedOut = false
+    // Playwright exposes no way to cancel an in-flight launch, so a timeout here can only
+    // stop *waiting* — the attempt keeps running. Count the ones we abandon so a browser
+    // that hangs on every launch can't have attempts piled on it forever.
+    this.abandonedLaunches++
+    const launch = this.launchBrowser(fingerprint).then(
+      (result) => {
+        if (!timedOut) {
+          this.abandonedLaunches--
+          return result
+        }
+        // We already gave up on this launch — don't leak the browser it finally produced.
+        // Stay charged until that close *actually* settles, with no timeout: releasing the
+        // slot on a bound would let genuinely unkillable Firefox processes accumulate
+        // silently, one per retry. Holding it means a doubly-wedged entry (launch hung,
+        // then close hung) stays down and the pool reports reduced `live` — the readiness
+        // gate surfaces that, which is the outcome we want over a quiet process leak.
+        void Promise.resolve(result.browser?.close()).then(
+          () => {
+            this.abandonedLaunches--
+          },
+          () => {
+            this.abandonedLaunches--
+          },
+        )
+        return null
+      },
+      (err) => {
+        this.abandonedLaunches--
+        if (timedOut) return null
+        throw err
+      },
+    )
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const result = await Promise.race([
+      launch,
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => {
+          timedOut = true
+          resolve(null)
+        }, ms)
+      }),
+    ]).finally(() => {
+      if (timer) clearTimeout(timer)
+    })
+    if (!result) {
+      throw new Error(`browser launch exceeded ${ms}ms; check outbound network and GeoIP access`)
+    }
+    return result
   }
 
   private killZombieCamoufox(): void {
@@ -289,53 +598,78 @@ export class BrowserPool {
     }
     entry.restarting = true
     entry.healthy = false
+    // Drop any checkout this entry was holding. Either release() already cleared it, or
+    // we are reclaiming a stalled one — in both cases the entry is ours now, and the
+    // bumped lease makes a late release() from the abandoned request a no-op.
+    entry.busy = false
+    entry.busySince = undefined
+    entry.stallAt = undefined
+    entry.lease++
     entry.restartReason = undefined
     console.warn(`[pool] browser ${entry.id} restarting: ${reason}`)
-    try {
-      await entry.context?.close()
-    } catch {}
-    try {
-      await entry.browser?.close()
-    } catch {}
-    entry.browser = null
-    entry.context = null
+    const dyingContext = entry.context
+    const dyingBrowser = entry.browser
+    const pendingPageCloses = entry.pendingPageCloses
+    delete entry.context
+    delete entry.browser
+    entry.pendingPageCloses = undefined
 
-    const MAX_ATTEMPTS = 3
-    const BASE_DELAY_MS = 5_000
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      try {
-        const { browser, context } = await this.launchBrowser(entry.fingerprint)
-        entry.browser = browser
-        entry.context = context
-        entry.healthy = true
-        entry.temporaryContextUses = 0
-        entry.restartCount++
-        entry.consecutiveFailures = 0
-        console.log(`[pool] browser ${entry.id} restarted (total: ${entry.restartCount}, attempt: ${attempt})`)
-        entry.restarting = false
-        return
-      } catch (err) {
-        console.error(`[pool] browser ${entry.id} restart attempt ${attempt}/${MAX_ATTEMPTS} failed:`, err)
-        this.killZombieCamoufox()
-        if (attempt < MAX_ATTEMPTS) {
-          const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1)
-          console.warn(`[pool] browser ${entry.id} backing off ${delay}ms before retry`)
-          await new Promise((r) => setTimeout(r, delay))
-        }
+    // Every await below is bounded, and that is the whole point. Camoufox/Firefox hangs
+    // on close when a content process is wedged (the hazard tier3/tier4 already guard
+    // their temporary contexts against), and camoufox-js's launch path can hang too. An
+    // unbounded await anywhere in here strands the entry with restarting=true forever:
+    // it is then excluded from `available` in getStats() and short-circuited by the
+    // `if (entry.restarting)` guard at the top, so the 30s health check can only log
+    // "disconnected, restarting" about it, never actually restart it. That is how a pool
+    // reaches zero live browsers while its restart counter sits frozen and the process
+    // looks perfectly healthy from the outside.
+    await settleWithin(pendingPageCloses ? () => pendingPageCloses : undefined, this.closeTimeoutMs)
+    await settleWithin(() => dyingContext?.close(), this.closeTimeoutMs)
+    await settleWithin(() => dyingBrowser?.close(), this.closeTimeoutMs)
+    try {
+      // Refuse to pile another attempt onto a backlog of launches we already gave up
+      // waiting for — each one may still be holding a real Firefox process we can't
+      // cancel. The entry stays unhealthy, so `live` drops and the readiness gate takes
+      // the pod out of rotation instead of quietly leaking processes.
+      if (this.abandonedLaunches >= this.maxAbandonedLaunches) {
+        throw new Error(`${this.abandonedLaunches} launches already abandoned; not starting another until one settles`)
       }
+      // On restart, keep the entry's original fingerprint so this browser instance
+      // keeps its identity across restart cycles (otherwise cross-session correlation
+      // becomes trivial).
+      const { browser, context } = await this.launchWithin(entry.fingerprint, this.launchTimeoutMs)
+      entry.browser = browser
+      entry.context = context
+      entry.healthy = true
+      entry.temporaryContextUses = 0
+      entry.restartCount++
+      entry.consecutiveFailures = 0
+      console.log(`[pool] browser ${entry.id} restarted (total: ${entry.restartCount})`)
+    } catch (err) {
+      // Leave the entry unhealthy with no browser attached. `restarting` clears in the
+      // finally, so the next health-check tick retries this entry from scratch.
+      console.error(`[pool] browser ${entry.id} failed to restart:`, err)
+      this.killZombieCamoufox()
+      entry.consecutiveFailures = (entry.consecutiveFailures ?? 0) + 1
+    } finally {
+      entry.restarting = false
     }
+  }
 
-    // All attempts exhausted — mark unhealthy and unlock restarting.
-    // Health check will retry on next cycle (30s) — exponential backoff
-    // prevents the tight restart loop that caused the original deadlock.
-    entry.consecutiveFailures = (entry.consecutiveFailures ?? 0) + 1
-    entry.restarting = false
-    console.error(`[pool] browser ${entry.id} exhausted ${MAX_ATTEMPTS} restart attempts, marking unhealthy (consecutive: ${entry.consecutiveFailures})`)
+  // A browser only counts if its transport is actually up. `healthy` is only refreshed
+  // every health-check tick, and busy entries are never probed at all, so without this a
+  // checkout whose browser died reads as capacity until its stall deadline passes.
+  private isUsable(entry: PoolEntry): boolean {
+    return Boolean(entry.context) && Boolean(entry.browser?.isConnected?.() ?? false)
   }
 
   getStats(): PoolStats {
+    const now = Date.now()
     const busy = this.entries.filter((e) => e.busy).length
-    const available = this.entries.filter((e) => !e.busy && !e.restarting && e.healthy && e.context).length
+    const available = this.entries.filter((e) => !e.busy && !e.restarting && e.healthy && this.isUsable(e)).length
+    const stalled = this.entries.filter((e) => this.isStalled(e, now)).length
+    // Busy entries that are still genuinely working: inside their deadline AND connected.
+    const busyLive = this.entries.filter((e) => e.busy && !this.isStalled(e, now) && this.isUsable(e)).length
     const totalRestarts = this.entries.reduce((sum, e) => sum + e.restartCount, 0)
     return {
       total: this.poolSize,
@@ -343,44 +677,91 @@ export class BrowserPool {
       available,
       restarts: totalRestarts,
       avgRestarts: totalRestarts / this.poolSize,
+      stalled,
+      // Real capacity: idle-and-connected plus in-flight-and-connected. Excludes
+      // restarting entries, wedged checkouts, and checkouts whose browser has died.
+      live: available + busyLive,
     }
   }
 
   async shutdown(): Promise<void> {
-    if (this.healthInterval) clearInterval(this.healthInterval)
+    this.shuttingDown = true
+    if (this.healthInterval) {
+      clearInterval(this.healthInterval)
+      delete this.healthInterval
+    }
     for (const entry of this.entries) {
-      await entry.context?.close().catch(() => {})
-      await entry.browser?.close().catch(() => {})
+      // Bounded for the same reason as restartEntry — an unbounded close here hangs
+      // SIGTERM handling until the supervisor's grace period expires and force-kills us.
+      await settleWithin(() => entry.context?.close(), this.closeTimeoutMs)
+      await settleWithin(() => entry.browser?.close(), this.closeTimeoutMs)
     }
     this.entries = []
   }
 }
 
-// Creates a fresh context from any browser with TRAWL init scripts applied.
-// A fresh context (no prior cookies/localStorage/service workers) gets CF managed-mode
-// treatment — challenge resolves in 3-4s vs ~40s for warm/reused contexts.
-// biome-ignore lint/suspicious/noExplicitAny: camoufox-js doesn't export BrowserContext type
-export const newFreshContext = async (browser: any, options?: { proxy?: string }): Promise<any> => {
+// These preserve the caller's Playwright or Patchright types; the two libraries are
+// structurally incompatible even though both expose the same runtime methods.
+// biome-ignore lint/suspicious/noExplicitAny: see comment above
+type FreshBrowser = any
+// biome-ignore lint/suspicious/noExplicitAny: see comment above
+type FreshContext = any
+export const newFreshContext = async (
+  browser: FreshBrowser,
+  options?: { proxy?: string; onCreated?: () => void; requestReplacement?: (reason: string) => void },
+): Promise<FreshContext> => {
   const context = await browser.newContext({
     viewport: null,
-    ...(options?.proxy ? { proxy: { server: options.proxy } } : {}),
+    ...(options?.proxy ? { proxy: toPlaywrightProxy(options.proxy) } : {}),
   })
-  await context.addInitScript(() => {
-    window.onerror = () => true
-    window.addEventListener(
-      "unhandledrejection",
-      (e: PromiseRejectionEvent) => {
-        e.preventDefault()
-      },
-      true,
+  options?.onCreated?.()
+  try {
+    await context.addInitScript(() => {
+      window.onerror = () => true
+      window.addEventListener(
+        "unhandledrejection",
+        (e: PromiseRejectionEvent) => {
+          e.preventDefault()
+        },
+        true,
+      )
+      const _orig = Element.prototype.attachShadow
+      Element.prototype.attachShadow = function (init: ShadowRootInit) {
+        const r = _orig.call(this, init)
+        Object.defineProperty(this, "shadowRootUnl", { configurable: true, value: r })
+        return r
+      }
+    })
+    return context
+  } catch (err) {
+    await closeTemporaryContext(
+      context,
+      options?.requestReplacement,
+      "temporary context initialization cleanup timed out",
+      CLOSE_TIMEOUT_MS,
     )
-    const _orig = Element.prototype.attachShadow
-    Element.prototype.attachShadow = function (init: ShadowRootInit) {
-      const r = _orig.call(this, init)
-      // biome-ignore lint/suspicious/noExplicitAny: extending DOM element with custom property
-      ;(this as any).shadowRootUnl = r
-      return r
-    }
+    throw err
+  }
+}
+
+export const closeTemporaryContext = async (
+  context: { close: AsyncAction } | undefined,
+  requestReplacement?: (reason: string) => void,
+  reason = "temporary context cleanup timed out",
+  timeoutMs = 5_000,
+): Promise<void> => {
+  if (!context) return
+  let settled = false
+  let timer: ReturnType<typeof setTimeout> | undefined
+  await Promise.race([
+    settle(() => context.close()).then(() => {
+      settled = true
+    }),
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, timeoutMs)
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer)
   })
-  return context
+  if (!settled) requestReplacement?.(reason)
 }

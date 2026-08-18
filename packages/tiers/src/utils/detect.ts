@@ -5,10 +5,12 @@ export type ChallengeType =
   | "recaptcha"
   | "cap"
   | "imperva"
+  | "akamai"
   | "none"
 
 export function isCloudflarePage(html: string, headers: Record<string, string>): boolean {
-  if (headers["cf-mitigated"]) return true
+  const cfMitigated = Object.entries(headers).find(([name]) => name.toLowerCase() === "cf-mitigated")?.[1]
+  if (cfMitigated?.toLowerCase() === "challenge") return true
   if (/<title>[^<]*(just a moment|ddos-guard|please wait|checking|attention required)[^<]*<\/title>/i.test(html))
     return true
   if (/checking your browser/i.test(html)) return true
@@ -19,6 +21,11 @@ export function isCloudflarePage(html: string, headers: Record<string, string>):
   if (/id="cf-challenge-running"/i.test(html)) return true
   // CF Turnstile interstitial wrapper
   if (/id="turnstile-wrapper"/i.test(html)) return true
+  // Active challenge orchestration markers. Unlike the passive telemetry markers
+  // below, these only occur while Cloudflare is serving an interstitial.
+  if (/_cf_chl_opt/i.test(html)) return true
+  if (/id=["']challenge-form["']/i.test(html)) return true
+  if (/orchestrate\/chl_page/i.test(html)) return true
   // DDoS-Guard
   if (/ddos-guard\.net|\.ddos-guard\.net/i.test(html)) return true
   // CF firewall/WAF deny page (error 1020 and friends) — static "blocked" page, not a
@@ -34,7 +41,8 @@ export function isCloudflarePage(html: string, headers: Record<string, string>):
   // bot-management telemetry. Matching on the marker alone flags real pages as blocked.
   // The actual challenge stub is always near-empty (nothing else can render before the
   // challenge resolves), so gate on page size too.
-  if (html.length < 3000 && /__CF\$cv\$params/i.test(html)) return true
+  if (html.length < 3000 && /__CF\$cv\$params|\/cdn-cgi\/challenge-platform\/[^"']*jsd\/main\.js/i.test(html))
+    return true
   return false
 }
 
@@ -83,10 +91,28 @@ export function hasImpervaChallenge(html: string, headers: Record<string, string
   return false
 }
 
+// Akamai Bot Manager "Behavioral Detection" (sec-cpt / SBSD) interstitial. Akamai
+// serves a near-empty page whose only real content is a hidden #sec-if-cpt-container
+// (the "behavioral-content" widget, often a press-and-hold button) plus an obfuscated
+// sensor script; once the sensor's XHR posts telemetry the page location.reload()s
+// into the real content. trawl solves this by driving human-like interaction and
+// waiting for the reload — see akamaiWait.ts. These DOM markers are challenge-only
+// (the class/id names don't appear on ordinary Akamai-fronted pages), so no size gate
+// is needed for them; the sensor-bootstrap fallback IS size-gated to avoid flagging
+// full pages that merely carry passive Akamai telemetry.
+export function hasAkamaiChallenge(html: string, _headers: Record<string, string> = {}): boolean {
+  if (/id=["']?sec-if-cpt-container|class=["'][^"']*behavioral-content|sec-bc-tile|scf-akamai-logo/i.test(html))
+    return true
+  if (/\/_sec\/(cp_challenge|verify)\//i.test(html)) return true
+  if (html.length < 3500 && /akamai\.com/i.test(html) && /(progress-button|behavioral|sec-cpt)/i.test(html)) return true
+  return false
+}
+
 export function detectChallengeType(html: string, headers: Record<string, string> = {}): ChallengeType {
   if (hasTurnstile(html)) return "cloudflare-turnstile"
   if (isCloudflarePage(html, headers)) return "cloudflare-interstitial"
   if (hasImpervaChallenge(html, headers)) return "imperva"
+  if (hasAkamaiChallenge(html, headers)) return "akamai"
   if (hasHcaptcha(html)) return "hcaptcha"
   if (hasRecaptcha(html)) return "recaptcha"
   if (hasCapChallenge(html)) return "cap"
@@ -98,9 +124,32 @@ export function isBlocked(status: number, html: string): boolean {
   if (status === 202 || status === 403 || status === 429) return true
   if (isCloudflarePage(html, {})) return true
   if (hasImpervaChallenge(html)) return true
+  if (hasAkamaiChallenge(html)) return true
   return false
 }
 
 export function needsJs(html: string, headers: Record<string, string>): boolean {
-  return isCloudflarePage(html, headers) || hasImpervaChallenge(html, headers)
+  return isCloudflarePage(html, headers) || hasImpervaChallenge(html, headers) || hasAkamaiChallenge(html, headers)
+}
+
+// Lean-body threshold per challenge type. When a known challenge returns a response
+// with body shorter than this, the page is wall-graded (only the bootstrap script
+// loaded, no real content yet). Absent = the challenge is never wall-graded by
+// body length alone (relies on 4xx/5xx instead).
+const LEAN_BODY_THRESHOLDS: Partial<Record<ChallengeType, number>> = {
+  "cloudflare-interstitial": 3000,
+  imperva: 5000,
+}
+
+// True if the response is a challenge wall (page access blocked) rather than a page
+// that happens to contain a captcha widget. 4xx/5xx is HTTP-standard; the lean-stub
+// checks are TRAWL-specific heuristics (CF's auto-resolving bootstrap and Imperva's
+// sensor cookie challenge can come at 200 with body < a few KB).
+export function isChallengeWall(status: number, bodyLength: number, challengeType: ChallengeType): boolean {
+  if (challengeType === "none") return false
+  if (status === 403 || status === 503) return true
+  if (challengeType === "akamai") return true
+  const threshold = LEAN_BODY_THRESHOLDS[challengeType]
+  if (threshold !== undefined && bodyLength < threshold) return true
+  return false
 }

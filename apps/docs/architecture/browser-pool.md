@@ -45,7 +45,10 @@ new BrowserPool({
   acquireTimeoutMs: 15000,    // BROWSER_ACQUIRE_TIMEOUT_MS — 15s default
   pollIntervalMs: 100,        // how often to re-check for an idle browser
   recycleAfterTemporaryContexts: 8,
-  contentProcesses: 2,         // BROWSER_CONTENT_PROCESSES — caps Firefox content procs
+  contentProcesses: 2,        // BROWSER_CONTENT_PROCESSES — caps Firefox content procs
+  stallAfterMs: 180000,       // BROWSER_STALL_TIMEOUT_MS
+  closeTimeoutMs: 10000,      // BROWSER_CLOSE_TIMEOUT_MS
+  launchTimeoutMs: 90000,     // BROWSER_LAUNCH_TIMEOUT_MS
 })
 ```
 
@@ -58,23 +61,15 @@ When `acquireTimeoutMs` elapses, the API surfaces the rejection as **HTTP 429** 
 Tier 3 and Tier 4 create short-lived isolated contexts for fresh challenge solves and proxy escalation. Those contexts are closed by the tier code, but long-running Firefox/Camoufox processes can still retain child content processes after repeated solves. Two complementary defenses bound this growth:
 
 1. **`contentProcesses` (default `2`)** caps Firefox content processes per browser at launch via the `dom.ipc.processCount` Firefox pref. This is the primary defense — bounds thread/RAM growth at the source regardless of context churn.
-2. **`recycleAfterTemporaryContexts` (default `8`)** is now **recycle-on-suspect**: the orchestrator only flags a browser for recycle when Tier 3/Tier 4 returns `blocked` / `needs-js`. Successful solves preserve cookies, `cf_clearance`, and warm fingerprint state. Set `BROWSER_RECYCLE_AFTER_CONTEXTS=0` to disable this recycling.
+2. **`recycleAfterTemporaryContexts` (default `8`)** counts every Tier 3/Tier 4 context creation, including successful, timed-out, errored, and blocked attempts. At the threshold the pool warms a replacement while the current browser remains available, swaps it in when idle, and then closes the retired browser. Only one replacement is warmed across the pool at a time, so the brief memory peak is bounded to one additional browser. Set `BROWSER_RECYCLE_AFTER_CONTEXTS=0` to disable this recycling.
 
-See issue #13 (original bug), #17 (recycle-on-suspect trade-off discussion), and the [configuration docs](/getting-started/configuration#browser_recycle_after_contexts) for tuning.
+See issues #13, #17, and #52, plus the [configuration docs](/getting-started/configuration#browser_recycle_after_contexts) for tuning.
 
 ## Self-healing
 
-A health check runs every 30 seconds:
+A health check runs every 30 seconds. Disconnected idle browsers are relaunched in place, and checkouts that exceed the request budget plus `BROWSER_STALL_TIMEOUT_MS` are reclaimed. Lease tokens prevent a late release from an abandoned request from freeing a replacement checkout.
 
-```typescript
-for (const entry of this.entries) {
-  if (entry.busy) continue
-  const connected = entry.browser?.isConnected() ?? false
-  if (!connected) await this.restartEntry(entry)
-}
-```
-
-`browser.isConnected()` is a synchronous check. A disconnected browser is relaunched in place. `restartCount` increments so you can monitor via `/health`.
+Browser/context close and browser launch operations are bounded by `BROWSER_CLOSE_TIMEOUT_MS` and `BROWSER_LAUNCH_TIMEOUT_MS`. This keeps a wedged Firefox process from leaving a pool entry permanently stuck in restart. `/health` reports 503 when no connected, non-stalled capacity remains.
 
 ## Why Camoufox Firefox, not Chromium?
 

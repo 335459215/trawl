@@ -1,11 +1,13 @@
 import type { BrowserHandle } from "@trawl/browser"
-import { FINGERPRINT, newFreshContext } from "@trawl/browser"
+import { closeTemporaryContext, FINGERPRINT, newFreshContext } from "@trawl/browser"
 import type { Cookie, TierResult } from "@trawl/types"
 import { solvePageCaptchas } from "../solvers"
+import { waitForAkamaiResolution } from "../utils/akamaiWait"
 import { waitForChallengeResolution } from "../utils/challengeWait"
 import { toCookies } from "../utils/cookies"
 import {
   detectChallengeType,
+  hasAkamaiChallenge,
   hasImpervaChallenge,
   isBlocked,
   isBrowserErrorPage,
@@ -13,13 +15,19 @@ import {
 } from "../utils/detect"
 import { normalizeHtml } from "../utils/html"
 import { waitForImpervaResolution } from "../utils/impervaWait"
+import { trackMainDocumentResponses } from "../utils/mainResponse"
 import { isHardNetworkFailure } from "../utils/network"
+import { captureResponse, isTextContentType } from "../utils/response"
 import type { RouteLike } from "../utils/sanitize"
 import { routeContinueOverrides } from "../utils/sanitize"
 
 export interface Tier3Result extends TierResult {
   tier: 3
+  effectiveUrl?: string
   html?: string
+  body?: Uint8Array
+  responseHeaders?: Record<string, string>
+  contentType?: string
   cookies?: Cookie[]
   userAgent?: string
   statusCode?: number
@@ -42,25 +50,22 @@ export async function runTier3(
   // engine state) that CF's behavioral analysis scores as suspicious — resulting in 40s
   // challenge evaluation. A fresh context with no prior state gets managed-mode treatment:
   // CF evaluates in under 1s and the challenge resolves in 3-4s total.
-  const freshCtx = await newFreshContext(handle.browser, { proxy: proxyUrl })
-  const page = await freshCtx.newPage()
+  let freshCtx: Awaited<ReturnType<typeof newFreshContext>> | undefined
 
   try {
+    freshCtx = await newFreshContext(handle.browser, {
+      proxy: proxyUrl,
+      onCreated: handle.noteTemporaryContext,
+      requestReplacement: handle.requestBrowserReplacement,
+    })
+    const page = await freshCtx.newPage()
     if ((extraHeaders && Object.keys(extraHeaders).length > 0) || method === "POST") {
       await page.route(url, (route: RouteLike) => {
         route.continue(routeContinueOverrides(route, extraHeaders, method, body))
       })
     }
 
-    let statusCode = 200
-    page.on("response", (res: { url(): string; status(): number }) => {
-      try {
-        const resUrl = res.url()
-        if (resUrl === url || resUrl.startsWith(url.replace(/\/$/, ""))) {
-          statusCode = res.status()
-        }
-      } catch {}
-    })
+    const mainResponse = trackMainDocumentResponses(page)
 
     // CF challenges can trigger sub-navigations that throw "navigation interrupted" —
     // we catch those so we can continue. Hard failures (DNS, connection refused) are
@@ -84,7 +89,9 @@ export async function runTier3(
     const resolution =
       challengeType === "imperva"
         ? await waitForImpervaResolution(page, remaining, url)
-        : await waitForChallengeResolution(page, remaining, url)
+        : challengeType === "akamai"
+          ? await waitForAkamaiResolution(page, remaining, url)
+          : await waitForChallengeResolution(page, remaining, url, () => mainResponse.headers)
 
     if (resolution !== "ok") {
       return {
@@ -95,10 +102,10 @@ export async function runTier3(
           resolution === "ip-blocked"
             ? challengeType === "imperva"
               ? "datacenter-ip-blocked (imperva sensor cookie obtained but challenge persisted — needs residential proxy)"
-              : "datacenter-ip-blocked (cf_clearance obtained but redirect never completed — needs residential proxy)"
-            : challengeType === "imperva"
-              ? "imperva-challenge-timeout"
-              : "cloudflare-challenge-timeout",
+              : challengeType === "akamai"
+                ? "datacenter-ip-blocked (Akamai sensor cookie obtained but challenge persisted — needs residential proxy)"
+                : "datacenter-ip-blocked (cf_clearance obtained but redirect never completed — needs residential proxy)"
+            : `${challengeType === "none" ? "cloudflare" : challengeType}-challenge-timeout`,
       }
     }
 
@@ -134,7 +141,7 @@ export async function runTier3(
       return { tier: 3, status: "error", durationMs: Date.now() - start, reason: errMsg }
     }
 
-    if (isCloudflarePage(html, {})) {
+    if (isCloudflarePage(html, mainResponse.headers)) {
       const pageTitle = await page.title().catch(() => "?")
       const pageUrl = page.url()
       console.log(`[tier3] cloudflare-persistent: url="${pageUrl}" title="${pageTitle}" html=${html.length}b`)
@@ -148,20 +155,31 @@ export async function runTier3(
       return { tier: 3, status: "blocked", durationMs: Date.now() - start, reason: "imperva-persistent" }
     }
 
-    if (isBlocked(statusCode, html)) {
-      return { tier: 3, status: "blocked", durationMs: Date.now() - start, reason: `http-${statusCode}` }
+    if (hasAkamaiChallenge(html)) {
+      const pageTitle = await page.title().catch(() => "?")
+      const pageUrl = page.url()
+      console.log(`[tier3] akamai-persistent: url="${pageUrl}" title="${pageTitle}" html=${html.length}b`)
+      return { tier: 3, status: "blocked", durationMs: Date.now() - start, reason: "akamai-persistent" }
+    }
+
+    if (isBlocked(mainResponse.status, html)) {
+      return { tier: 3, status: "blocked", durationMs: Date.now() - start, reason: `http-${mainResponse.status}` }
     }
 
     const cookies: Cookie[] = toCookies(await freshCtx.cookies())
+
+    const captured = await captureResponse(mainResponse.response)
 
     return {
       tier: 3,
       status: "success",
       durationMs: Date.now() - start,
-      html: normalizeHtml(html),
+      effectiveUrl: page.url(),
+      html: !captured.contentType || isTextContentType(captured.contentType) ? normalizeHtml(html) : "",
+      ...captured,
       cookies,
       userAgent: await page.evaluate(() => navigator.userAgent).catch(() => FINGERPRINT.userAgent),
-      statusCode,
+      statusCode: mainResponse.status,
       captchasSolved: captchasSolved.length > 0 ? captchasSolved : undefined,
     }
   } catch (err) {
@@ -172,10 +190,8 @@ export async function runTier3(
       reason: err instanceof Error ? err.message : String(err),
     }
   } finally {
-    await page.close().catch(() => {})
-    // Bound context.close() with a timeout — Camoufox/Firefox occasionally hangs on
-    // close when a content process is wedged, leaking the process until the next
-    // browser recycle. 5s is well above the typical <500ms close path.
-    await Promise.race([freshCtx.close(), new Promise<void>((resolve) => setTimeout(resolve, 5000))]).catch(() => {})
+    // Closing the context closes all of its pages. If Firefox wedges during cleanup,
+    // ask the pool to replace this browser as soon as the lease is released.
+    await closeTemporaryContext(freshCtx, handle.requestBrowserReplacement, "tier3 context cleanup timed out")
   }
 }

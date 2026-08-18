@@ -42,28 +42,29 @@ RUN bun install --frozen-lockfile --production --omit=dev --linker=hoisted \
 FROM oven/bun:1.3.14 AS camoufox
 ENV CAMOUFOX_INSTALL_DIR=/opt/camoufox
 
+ARG UBO_VERSION=1.73.0
+ARG UBO_AMO_FILE_ID=4940584
+ARG UBO_SHA256=bccc51a773150af4af6e1fd62c7bfdeb7238b79ff2381b998fa9f2e38f64786a
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl unzip ca-certificates && rm -rf /var/lib/apt/lists/*
 
-# Pin Camoufox to v150.0.2-beta.25 (verified working). The camoufox-js `fetch` always
-# downloads the latest release, which broke in 152.x (browser binary no longer in the
-# zip — see Camoufox upstream release notes). Direct curl keeps builds reproducible.
-#
-# Asset naming: arm64 = alpha.25 build, x86_64 = alpha.26 rebuild (only x86_64 was
-# rebuilt in the v150.0.2-beta.25 release).
+# Pin the browser release and verify the architecture-specific asset before extracting it.
+# Direct downloads keep builds reproducible and avoid camoufox-js resolving "latest".
 ARG TARGETARCH
 RUN --mount=type=secret,id=GITHUB_TOKEN,env=GITHUB_TOKEN \
     case "$TARGETARCH" in \
-      amd64) ZIP="camoufox-150.0.2-alpha.26-lin.x86_64.zip" ;; \
-      arm64) ZIP="camoufox-150.0.2-alpha.25-lin.arm64.zip" ;; \
+      amd64) ZIP="camoufox-152.0.4-beta.28-lin.x86_64.zip"; SHA256="924f3109ccd6d47cd6a0384d67a345fadf975d48b6319f8dbbd5954c588982bd" ;; \
+      arm64) ZIP="camoufox-152.0.4-beta.28-lin.arm64.zip"; SHA256="3a105a2fc929e80a79b4b7fce2c93ed62c4fb2c877f3c1ed2a5d66a1c4fe968f" ;; \
       *) echo "unsupported arch: $TARGETARCH"; exit 1 ;; \
     esac && \
     curl -fsSL \
-      "https://github.com/daijro/camoufox/releases/download/v150.0.2-beta.25/${ZIP}" \
+      "https://github.com/daijro/camoufox/releases/download/v152.0.4-beta.28/${ZIP}" \
       -o /tmp/camoufox.zip && \
+    echo "${SHA256}  /tmp/camoufox.zip" | sha256sum --check --strict - && \
     unzip -q /tmp/camoufox.zip -d /opt/camoufox && \
     rm /tmp/camoufox.zip && \
-    printf '{"version":"150.0.2","release":"alpha.26"}\n' > /opt/camoufox/version.json && \
+    printf '{"version":"152.0.4","release":"beta.28"}\n' > /opt/camoufox/version.json && \
     chmod -R 755 /opt/camoufox && \
     rm -rf /opt/camoufox/fonts/macos /opt/camoufox/fonts/windows
 
@@ -76,11 +77,25 @@ RUN --mount=type=secret,id=GITHUB_TOKEN,env=GITHUB_TOKEN \
 # Baking a verified copy into the image makes startup deterministic and removes the
 # runtime GitHub dependency + first-launch download latency. The size check fails the
 # build if the download is truncated, so a corrupt file can never be baked in.
+ARG GEOLITE_RELEASE=2026.08.07
+ARG GEOLITE_CITY_SHA256=5c32206cd9a67d3b8995e8ca010191a802e9cb06d3c089963f08b55deb1bd921
 RUN curl -fsSL \
-      "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-City.mmdb" \
+      "https://github.com/P3TERX/GeoLite.mmdb/releases/download/${GEOLITE_RELEASE}/GeoLite2-City.mmdb" \
       -o /opt/camoufox/GeoLite2-City.mmdb && \
-    [ "$(stat -c%s /opt/camoufox/GeoLite2-City.mmdb)" -gt 10000000 ] || \
-      { echo "GeoLite2-City.mmdb download too small / failed"; exit 1; }
+    echo "${GEOLITE_CITY_SHA256}  /opt/camoufox/GeoLite2-City.mmdb" | sha256sum --check --strict -
+
+# Bake uBlock Origin into Camoufox's expected addon directory. camoufox-js still
+# performs its normal addon registration at startup, but no runtime download or
+# extraction is needed (including when /opt/camoufox is read-only).
+RUN curl -fsSL \
+      "https://addons.mozilla.org/firefox/downloads/file/${UBO_AMO_FILE_ID}/ublock_origin-${UBO_VERSION}.xpi" \
+      -o /tmp/ubo.xpi && \
+    echo "${UBO_SHA256}  /tmp/ubo.xpi" | sha256sum --check --strict - && \
+    mkdir -p /opt/camoufox/addons/UBO && \
+    unzip -q /tmp/ubo.xpi -d /opt/camoufox/addons/UBO && \
+    test -f /opt/camoufox/addons/UBO/manifest.json && \
+    test "$(bun -e 'console.log(JSON.parse(await Bun.file("/opt/camoufox/addons/UBO/manifest.json").text()).version)')" = "${UBO_VERSION}" && \
+    rm /tmp/ubo.xpi
 
 # ── Stage 3: lean runtime (only API-required files) ────────────────────────────
 # debian:bookworm-slim replaces ubuntu:22.04 — same glibc family, ~50 MB smaller base.
@@ -108,7 +123,8 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
       fonts-liberation \
       ca-certificates \
       curl \
-    && apt-get clean
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /usr/share/locale /usr/share/doc /usr/share/man
 
 COPY --from=oven/bun:1.3.14  /usr/local/bin/bun /usr/local/bin/bun
 COPY --from=camoufox          /opt/camoufox      /opt/camoufox
@@ -128,7 +144,19 @@ COPY packages/tiers/   /app/packages/tiers/
 COPY apps/api/         /app/apps/api/
 COPY package.json      /app/
 
-ENV CAMOUFOX_INSTALL_DIR=/opt/camoufox
+ENV CAMOUFOX_INSTALL_DIR=/opt/camoufox \
+    HOME=/tmp \
+    # Safe Bun runtime knobs — all tested runtime-neutral (no behavior change).
+    BUN_DISABLE_CJS=1 \
+    BUN_DEBUG=0 \
+    BUN_DISABLE_SOURCEMAPS=1 \
+    BUN_HTTP_KEEPALIVE=0 \
+    BUN_AGENT_DISABLE=1 \
+    BUN_INSPECT=0 \
+    BUN_LOCKFILE_MIGRATION=false \
+    MIMALLOC_PURGE_DELAY=0 \
+    NODE_NO_WARNINGS=1
+
 WORKDIR /app
 EXPOSE 8191
 CMD ["bun", "run", "apps/api/src/index.ts"]

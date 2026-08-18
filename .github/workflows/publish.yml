@@ -1,9 +1,28 @@
 name: Publish
 
+# Builds `:X.Y.Z` and `:latest` tags of `ghcr.io/.../trawl` from
+# `apps/api/Dockerfile` on `v*` release tag pushes. The `v` prefix is stripped
+# per Docker convention (git tag `v1.0.0` -> docker tag `1.0.0`); `:latest`
+# auto-attaches via the default `latest=auto` flavor of `type=semver`.
+#
+# Lives separately from publish-nightly.yml (main branch pushes) and
+# publish-baseline.yml (baseline runtime pushes). `v*-baseline` is
+# intentionally excluded so a baseline-only release doesn't also push
+# `:X.Y.Z`/`:latest` — publish-baseline.yml owns that path.
+#
+# Tag contract:
+#   - push `v*` -> :X.Y.Z + :latest
+#   - push `v*-baseline` -> nothing here (excluded)
+#   - push `main` -> nothing here (handled by publish-nightly.yml)
+
 on:
   push:
-    branches: [main]
-    tags: ["v*"]
+    tags:
+      # Release tags — pure semver only. `v*-baseline` is intentionally excluded
+      # so a baseline-only release (e.g., `v1.0.0-baseline`) does NOT push `:X.Y.Z`
+      # or `:latest` from this workflow; publish-baseline.yml owns that path.
+      - "v*"
+      - "!v*-baseline"
 
 env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/trawl
@@ -24,17 +43,17 @@ jobs:
       packages: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
-      - uses: docker/metadata-action@v5
+      - uses: docker/metadata-action@v6
         id: meta
         with:
           images: ${{ env.IMAGE }}
@@ -44,7 +63,7 @@ jobs:
           platform=${{ matrix.platform }}
           echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
 
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         id: build
         with:
           context: .
@@ -53,8 +72,8 @@ jobs:
           push: true
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true
-          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
-          cache-to: type=gha,scope=${{ env.PLATFORM_PAIR }},mode=max
+          cache-from: type=gha,scope=trawl-release-${{ matrix.platform }}
+          cache-to: type=gha,scope=trawl-release-${{ matrix.platform }},mode=max
           secrets: |
             GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
 
@@ -64,9 +83,9 @@ jobs:
           digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
-          name: digests-${{ env.PLATFORM_PAIR }}
+          name: digests-release-${{ env.PLATFORM_PAIR }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
@@ -79,28 +98,29 @@ jobs:
       packages: write
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: /tmp/digests
-          pattern: digests-*
+          pattern: digests-release-*
           merge-multiple: true
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
-      - uses: docker/metadata-action@v5
+      - uses: docker/metadata-action@v6
         id: meta
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            # Versioned release tag: git tag v1.0.0 → docker tag 1.0.0 (strips the v prefix,
+            # per Docker convention; type=ref would mirror the v through). type=semver also
+            # auto-attaches :latest via the default latest=auto flavor.
             type=semver,pattern={{version}}
-            type=sha,prefix=sha-
 
       - name: Create and push multi-arch manifest
         working-directory: /tmp/digests
@@ -110,4 +130,9 @@ jobs:
             $(printf '${{ env.IMAGE }}@sha256:%s ' *)
 
       - name: Inspect manifest
-        run: docker buildx imagetools inspect ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
+        run: |
+          # Pull the first tag actually pushed by docker/metadata-action in the previous
+          # step. DOCKER_METADATA_OUTPUT_JSON.tags[] is already fully-qualified
+          # ("ghcr.io/germondai/trawl:1.0.0" / ":latest") so no $IMAGE prefix needed.
+          tag=$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          docker buildx imagetools inspect "$tag"

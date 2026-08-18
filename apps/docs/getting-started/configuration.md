@@ -67,10 +67,10 @@ When the timeout fires, both `/v1` and `/scrape` return **HTTP 429** with the Fl
 
 **Default:** `8`
 
-How many `blocked` / `needs-js` outcomes a pooled browser can produce before TRAWL restarts the full browser process. The recycle counter only increments when Tier 3 or Tier 4 reports the upstream actively rejected the browser's profile — successful solves preserve cookies, `cf_clearance`, and warm fingerprint state. This avoids the HTTP-429 storm that occurred when the pool preemptively recycled mid-flight (issue #17).
+How many Tier 3 or Tier 4 temporary contexts a pooled browser can create before TRAWL rolling-replaces the full browser process. Every context counts, regardless of whether the attempt succeeds, times out, errors, or is blocked. TRAWL warms one replacement while the existing browser remains available, installs it when the entry is idle, then closes the retired browser. This briefly raises the pool by one browser, and replacements are serialized pool-wide to bound that peak.
 
 ```ini
-BROWSER_RECYCLE_AFTER_CONTEXTS=8   # default - recycle after 8 blocked/needs-js outcomes
+BROWSER_RECYCLE_AFTER_CONTEXTS=8   # default - replace after 8 Tier 3/4 contexts
 BROWSER_RECYCLE_AFTER_CONTEXTS=0   # disable browser recycling entirely
 ```
 
@@ -85,13 +85,24 @@ BROWSER_CONTENT_PROCESSES=2   # default - conservative cap, lowest RAM/CPU
 BROWSER_CONTENT_PROCESSES=4   # raise if CF/Imperva challenges stall
 ```
 
+### Browser recovery timeouts
+
+| Variable | Default | Purpose |
+| --- | ---: | --- |
+| `BROWSER_STALL_TIMEOUT_MS` | `180000` | Grace period after a request's own timeout before its browser checkout is reclaimed |
+| `BROWSER_CLOSE_TIMEOUT_MS` | `10000` | Maximum wait for a wedged browser or context to close |
+| `BROWSER_LAUNCH_TIMEOUT_MS` | `90000` | Maximum wait for Camoufox to launch |
+
+These bounds keep an unresponsive Firefox process from permanently consuming a pool slot. The defaults are suitable for most installations.
+
 ## Session Cache
 
 ### `SESSION_TTL_SECONDS`
 
 **Default:** `3600` (1 hour)
 
-How long Cloudflare cookies are cached in Redis per domain. After this TTL the next request to the domain triggers a fresh challenge solve (Tier 3) and refreshes the cache.
+How long solved browser cookies and user-agent state are cached in Redis per domain. After this TTL
+the next protected request triggers a fresh challenge solve (Tier 3) and refreshes the cache.
 
 Cloudflare's `cf_clearance` cookie typically has a 30-minute expiry. Setting `SESSION_TTL_SECONDS` below 1800 wastes cache hits; setting it above 7200 risks replaying expired cookies (TRAWL handles this gracefully by invalidating the cache and falling back to Tier 3).
 
@@ -106,10 +117,18 @@ SESSION_TTL_SECONDS=1800   # more conservative
 
 **Default:** _(empty — no proxy)_
 
-Datacenter proxy pool used for Tier 3 (fresh challenge solve). Format: `protocol://user:pass@host:port`, or a **comma-separated list** for multiple proxies:
+Datacenter proxy pool used for Tier 3 (fresh challenge solve). TRAWL passes these endpoints to the
+browser and supports HTTP and SOCKS5 forms:
 
 ```ini
+PROXY_URL=http://dc-proxy.example.com:8080
 PROXY_URL=http://user:pass@dc-proxy.example.com:8080
+PROXY_URL=socks5://dc-proxy.example.com:1080
+```
+
+HTTP credentials can be embedded in the URL. For multiple endpoints, use a comma-separated list:
+
+```ini
 PROXY_URL=http://user:pass@dc1.example.com:8080,http://user:pass@dc2.example.com:8080
 ```
 
@@ -123,7 +142,11 @@ Residential proxy pool used for Tier 4 (when the datacenter IP is flagged). Same
 
 ```ini
 RESIDENTIAL_PROXY_URL=http://user:pass@residential.example.com:8080
+RESIDENTIAL_PROXY_URL=socks5://residential.example.com:1080
 ```
+
+Provider labels such as "rotating", "sticky", "country", or "session" do not change the TRAWL
+format. Use the hostname, port, and credentials supplied by the provider.
 
 ### `PROXY_LIST_FILE` / `RESIDENTIAL_PROXY_LIST_FILE`
 
@@ -135,6 +158,35 @@ Alternative to cramming a large proxy list into `PROXY_URL`/`RESIDENTIAL_PROXY_U
 PROXY_LIST_FILE=/etc/trawl/datacenter-proxies.txt
 RESIDENTIAL_PROXY_LIST_FILE=/etc/trawl/residential-proxies.txt
 ```
+
+Example file:
+
+```text
+# /etc/trawl/residential-proxies.txt
+http://user:pass@residential-1.example.com:8080
+http://user:pass@residential-2.example.com:8080
+socks5://residential-3.example.com:1080
+```
+
+When using Docker, the path is inside the TRAWL container. Mount the file and pass the same
+in-container path:
+
+```yaml
+services:
+  trawl:
+    environment:
+      RESIDENTIAL_PROXY_LIST_FILE: /etc/trawl/residential-proxies.txt
+    volumes:
+      - ./residential-proxies.txt:/etc/trawl/residential-proxies.txt:ro
+```
+
+For a single endpoint or a short pool, a local `.env` beside `docker-compose.yml` is enough:
+
+```ini
+RESIDENTIAL_PROXY_URL=http://user:pass@residential.example.com:8080
+```
+
+The supplied Compose files pass all four proxy variables into the container.
 
 ### Rotation and failure handling
 
@@ -150,13 +202,31 @@ Both `POST /scrape` and `POST /v1` accept an optional `proxy` field in the reque
 
 Note: `proxy` on `/v1` is a TRAWL-specific extension — it is not part of the real FlareSolverr v2 contract, so other FlareSolverr-compatible clients simply won't send it.
 
+### Test an endpoint
+
+Test an HTTP proxy independently before starting TRAWL:
+
+```bash
+curl --proxy http://user:pass@proxy.example.com:8080 https://api.ipify.org
+```
+
+For SOCKS5 with proxy-side DNS resolution:
+
+```bash
+curl --proxy socks5h://proxy.example.com:1080 https://api.ipify.org
+```
+
+Use the provider's exact endpoint and authentication details. A working `curl` test confirms
+connectivity, but the destination can still reject that proxy IP during a browser challenge.
+
 ## Ports
 
 ### `PORT`
 
 **Default:** `8191`
 
-Host port the Docker port mapping forwards to TRAWL's internal listener. Defaults to `8191` — the same port FlareSolverr and Byparr use, so you can swap TRAWL in without changing any *arr app settings. The container itself always listens on `8191` internally; `PORT` only changes the **host-side** port (e.g. `"${PORT:-8191}:8191"` in every compose file).
+API listener port. It defaults to `8191`, the same port used by FlareSolverr and Byparr.
+The supplied Compose files use `${PORT:-8191}` for the host side of the `8191` container mapping.
 
 To run TRAWL alongside FlareSolverr (or any other service that already binds `8191` on the host), set `PORT` in your shell or `.env` to any free port **before** running `docker compose up`:
 
@@ -165,32 +235,13 @@ PORT=9191 docker compose up -d
 # TRAWL reachable at http://localhost:9191, while port 8191 stays free for FlareSolverr.
 ```
 
-### `PORT_WEB`
+## Forward proxy
 
-**Default:** `3000`
-
-Port the Nuxt landing page listens on.
+The optional general HTTP/HTTPS proxy has its own listener, CA, tier cap, and debug settings.
+See [Proxy Configuration](/proxy/configuration) for all `MITM_PROXY_*` variables and deployment
+examples.
 
 ---
 
-## Full `.env.example`
-
-```ini
-# ── Redis ─────────────────────────────────────
-REDIS_URL=redis://localhost:6379
-
-# ── Browser pool ──────────────────────────────
-BROWSER_POOL_SIZE=3
-BROWSER_ACQUIRE_TIMEOUT_MS=15000
-SESSION_TTL_SECONDS=3600
-
-# ── Proxies (optional, comma-separated lists) ─
-PROXY_URL=
-RESIDENTIAL_PROXY_URL=
-PROXY_LIST_FILE=
-RESIDENTIAL_PROXY_LIST_FILE=
-
-# ── Ports ─────────────────────────────────────
-PORT=8191
-PORT_WEB=3000
-```
+The repository's [`.env.example`](https://github.com/germondai/trawl/blob/main/.env.example) is the
+canonical copyable environment template.

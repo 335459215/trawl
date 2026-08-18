@@ -1,11 +1,13 @@
 import type { BrowserHandle } from "@trawl/browser"
-import { FINGERPRINT } from "@trawl/browser"
+import { closeTemporaryContext, FINGERPRINT, newFreshContext } from "@trawl/browser"
 import type { Cookie, TierResult } from "@trawl/types"
 import { solvePageCaptchas } from "../solvers"
+import { waitForAkamaiResolution } from "../utils/akamaiWait"
 import { waitForChallengeResolution } from "../utils/challengeWait"
 import { toCookies } from "../utils/cookies"
 import {
   detectChallengeType,
+  hasAkamaiChallenge,
   hasImpervaChallenge,
   isBlocked,
   isBrowserErrorPage,
@@ -13,13 +15,19 @@ import {
 } from "../utils/detect"
 import { normalizeHtml } from "../utils/html"
 import { waitForImpervaResolution } from "../utils/impervaWait"
+import { trackMainDocumentResponses } from "../utils/mainResponse"
 import { isHardNetworkFailure } from "../utils/network"
+import { captureResponse, isTextContentType } from "../utils/response"
 import type { RouteLike } from "../utils/sanitize"
 import { routeContinueOverrides } from "../utils/sanitize"
 
 export interface Tier4Result extends TierResult {
   tier: 4
+  effectiveUrl?: string
   html?: string
+  body?: Uint8Array
+  responseHeaders?: Record<string, string>
+  contentType?: string
   cookies?: Cookie[]
   userAgent?: string
   statusCode?: number
@@ -41,32 +49,15 @@ export async function runTier4(
   // Proxies must be set at context creation time in Playwright — they cannot be
   // applied per-request. We create a fresh context here and close it when done,
   // leaving the pool's shared context untouched.
-  let proxyContext: Awaited<ReturnType<typeof handle.browser.newContext>> | null = null
+  const state: { proxyContext?: Awaited<ReturnType<typeof newFreshContext>> } = {}
 
   try {
-    // Camoufox handles fingerprinting at the C++ level — only the proxy needs to
-    // be set at context creation (Playwright requires proxy at context init time).
-    proxyContext = await handle.browser.newContext({
-      proxy: { server: proxyUrl },
-      viewport: null,
+    const proxyContext = await newFreshContext(handle.browser, {
+      proxy: proxyUrl,
+      onCreated: handle.noteTemporaryContext,
+      requestReplacement: handle.requestBrowserReplacement,
     })
-    await proxyContext.addInitScript(() => {
-      window.onerror = () => true
-      window.addEventListener(
-        "unhandledrejection",
-        (e: PromiseRejectionEvent) => {
-          e.preventDefault()
-        },
-        true,
-      )
-      const _orig = Element.prototype.attachShadow
-      Element.prototype.attachShadow = function (init: ShadowRootInit) {
-        const r = _orig.call(this, init)
-        // biome-ignore lint/suspicious/noExplicitAny: monkeypatching Element.prototype — 'this' is HTMLElement at runtime, no TS type
-        ;(this as any).shadowRootUnl = r
-        return r
-      }
-    })
+    state.proxyContext = proxyContext
 
     const page = await proxyContext.newPage()
 
@@ -76,14 +67,7 @@ export async function runTier4(
       })
     }
 
-    let statusCode = 200
-    page.on("response", (res: { url(): string; status(): number }) => {
-      try {
-        if (res.url() === url || res.url().startsWith(url.replace(/\/$/, ""))) {
-          statusCode = res.status()
-        }
-      } catch {}
-    })
+    const mainResponse = trackMainDocumentResponses(page)
 
     const gotoErr = await page
       .goto(url, {
@@ -102,7 +86,9 @@ export async function runTier4(
     const resolution =
       challengeType === "imperva"
         ? await waitForImpervaResolution(page, remaining, url)
-        : await waitForChallengeResolution(page, remaining, url)
+        : challengeType === "akamai"
+          ? await waitForAkamaiResolution(page, remaining, url)
+          : await waitForChallengeResolution(page, remaining, url, () => mainResponse.headers)
 
     if (resolution !== "ok") {
       return {
@@ -112,9 +98,7 @@ export async function runTier4(
         reason:
           resolution === "ip-blocked"
             ? "proxy-ip-blocked"
-            : challengeType === "imperva"
-              ? "imperva-challenge-timeout"
-              : "cloudflare-challenge-timeout",
+            : `${challengeType === "none" ? "cloudflare" : challengeType}-challenge-timeout`,
       }
     }
 
@@ -144,7 +128,7 @@ export async function runTier4(
       }
     }
 
-    if (isCloudflarePage(html, {})) {
+    if (isCloudflarePage(html, mainResponse.headers)) {
       return {
         tier: 4,
         status: "blocked",
@@ -162,20 +146,33 @@ export async function runTier4(
       }
     }
 
-    if (isBlocked(statusCode, html)) {
-      return { tier: 4, status: "blocked", durationMs: Date.now() - start, reason: `http-${statusCode}` }
+    if (hasAkamaiChallenge(html)) {
+      return {
+        tier: 4,
+        status: "blocked",
+        durationMs: Date.now() - start,
+        reason: "akamai-persistent",
+      }
+    }
+
+    if (isBlocked(mainResponse.status, html)) {
+      return { tier: 4, status: "blocked", durationMs: Date.now() - start, reason: `http-${mainResponse.status}` }
     }
 
     const cookies: Cookie[] = toCookies(await proxyContext.cookies())
+
+    const captured = await captureResponse(mainResponse.response)
 
     return {
       tier: 4,
       status: "success",
       durationMs: Date.now() - start,
-      html: normalizeHtml(html),
+      effectiveUrl: page.url(),
+      html: !captured.contentType || isTextContentType(captured.contentType) ? normalizeHtml(html) : "",
+      ...captured,
       cookies,
       userAgent: await page.evaluate(() => navigator.userAgent).catch(() => FINGERPRINT.userAgent),
-      statusCode,
+      statusCode: mainResponse.status,
       captchasSolved: captchasSolved.length > 0 ? captchasSolved : undefined,
     }
   } catch (err) {
@@ -186,11 +183,6 @@ export async function runTier4(
       reason: err instanceof Error ? err.message : String(err),
     }
   } finally {
-    // Same timeout-bounded close as tier3 — see comment there.
-    if (proxyContext) {
-      await Promise.race([proxyContext.close(), new Promise<void>((resolve) => setTimeout(resolve, 5000))]).catch(
-        () => {},
-      )
-    }
+    await closeTemporaryContext(state.proxyContext, handle.requestBrowserReplacement, "tier4 context cleanup timed out")
   }
 }

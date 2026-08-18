@@ -7,6 +7,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-08-10
+
+### Changed
+- **Cold-start performance milestone:** TRAWL's complete first request, including browser launch, is now nearly **4x faster** in like-for-like Docker benchmarks. Redis validation and browser warmup now run concurrently, Tier 0 becomes available immediately, and browser capacity is published progressively. Warm-request timings vary with browser state, session caching, and challenge behavior and are not included in this cold-start comparison.
+- Bump all application and internal package versions to `1.4.0`.
+- Update Biome to 2.5.7, Memoirist to 1.2.2, Nuxt to 4.5.2, and Nuxt SEO to 5.3.11. TypeScript remains on 5.9.3 for the Nuxt app and Playwright remains on 1.60.0 for Camoufox compatibility.
+- Update GitHub Actions to their current stable major releases and make the CI release gate read-only and reproducible.
+- Pin the runtime to Bun 1.3.14, Camoufox v152.0.4-beta.28, GeoLite2 City 2026.08.07, and Redis 8.8.1, with SHA-256 verification for downloaded browser/runtime data assets.
+- The remaining audit findings are confined to Nuxt/VitePress development and build-time dependency trees; no compatible upstream update is currently available for those transitive packages.
+
+### Fixed
+- Support explicit non-root Docker users by baking the pinned uBlock Origin addon into both API image variants and using a writable temporary home directory. Document CA volume ownership and read-only container requirements (#60).
+- Reduce cold-start latency by warming Redis alongside the browser pool, publishing the first browser immediately, warming the remaining browsers concurrently, and accepting Tier 0 proxy traffic during warmup. Unavailable Redis now disables Tier 2 promptly instead of delaying the first request. Tier 0 also handles informational HTTP responses correctly and escalates authoritative `cf-mitigated: challenge` headers immediately.
+- Keep browser-tier status, headers, content type, and raw body aligned with the latest main-frame navigation response across redirects, and prevent persistent Cloudflare challenges from being returned as successful rendered pages (#53).
+- Translate Prowlarr's serialized `headers.contentType` metadata at the FlareSolverr `/v1` compatibility boundary and discard `contentLength`, allowing form POST requests to enter the scraper pipeline (#50).
+- Bound Camoufox memory growth by counting every Tier 3/4 temporary context and rolling-replacing browsers at `BROWSER_RECYCLE_AFTER_CONTEXTS`, while keeping existing capacity available during warm-up. Replacement launches are serialized, cleanup is timeout-bounded, and failed launches retain the usable browser (#52).
+
+## [1.3.1] - 2026-08-02
+
+### Fixed
+- Keep pooled browser contexts under `BrowserPool` ownership so repeat Tier 2 requests cannot reuse a context closed by a separate cache (#45).
+
+### Changed
+- Bump all application and internal package versions to `1.3.1`.
+
+## [1.3.0] - 2026-08-02
+
+### Added
+- Detect and resolve Akamai Bot Manager behavioral interstitials across scraper tiers and the HTTP/HTTPS proxy (#33).
+- Document supported upstream proxy formats, local Compose configuration, and residential proxy pools (#26).
+
+### Fixed
+- Reject non-object request bodies and missing, non-string, or blank `url` values with HTTP 400 before scraper-tier execution (#34).
+- Recover stalled browser checkouts and bound browser close/launch operations so wedged Firefox processes cannot silently exhaust the pool (#36, #37, #48).
+- Report HTTP 503 from `/health` whenever the browser pool has no live capacity.
+- Pass authenticated proxy credentials to Firefox separately from the proxy server URL in Tier 3 and Tier 4 (#40).
+- Return complete Tier 1 text responses instead of the 4 KiB challenge-detection preview (#46, #47).
+- Record the correct architecture-specific Camoufox release metadata in API images.
+
+### Changed
+- Bump all application and internal package versions to `1.3.0`.
+- Update workspace dependencies to their latest compatible releases. TypeScript remains on 5.9 for the Nuxt app until `vue-tsc` supports TypeScript 7.
+
+## [1.2.0] - 2026-07-26
+
+### Added
+- **Tier 0 direct forward in the MITM proxy** (`apps/api/src/proxy/directForward.ts`): the proxy at `:8192` now forwards requests directly to upstream via raw TCP/TLS instead of spinning up a browser for every request. Pool is reserved for the requests that actually need CF bypass; Netflix/YouTube/banks/etc. flow at near-direct speed.
+- **Smart adaptive streaming** (`apps/api/src/proxy/streaming.ts`): small JSON/HTML/text responses are buffered so the challenge detector can inspect them; video/audio/binary files (`.mp4`, `.mkv`, `.m3u8`, `.zip`, `.exe`, `.dmg`, etc.) are streamed straight through to the client. Default threshold: 8 MiB.
+- **Per-hostname challenge cache** (`apps/api/src/proxy/challengeCache.ts`): the proxy remembers which hostnames recently returned Cloudflare challenges and sends repeat visits directly to the tiered solver for 5 minutes.
+- **Persistent browser context cache**: solved sessions retain their browser fingerprint, cookies, cache, and storage across proxy requests, with bounded per-proxy reuse and cleanup.
+- **General HTTP/HTTPS proxy support**: CONNECT tunneling, plain HTTP absolute-form requests, WebSocket upgrades, request bodies, redirects, authentication headers, cookies, and HTTP Range/206 responses are forwarded with their required semantics.
+- **`proxySanitizeHeaders()`** (`packages/tiers/src/utils/sanitize.ts`): permissive header sanitizer for the transparent MITM proxy — passes `Authorization`, `Cookie`, `Range`, `User-Agent`, `Referer`, and custom API tokens through, strips only RFC 7230 hop-by-hop headers.
+- **Raw bytes in `@trawl/tiers`**: `ScrapeResult` and tier results now expose `body?: Uint8Array`, `responseHeaders?: Record<string,string>`, and `contentType?: string` alongside the existing `html` field. The proxy uses these fields to preserve binary content without HTML normalization.
+- **Tier 1 method handling fix**: `runTier1()` now forwards the request body for `PUT`, `PATCH`, `DELETE`, `QUERY` (was only `POST`).
+- **Graceful proxy shutdown** (`shutdownMitmProxy()`): the API captures the proxy handle on startup and `lifecycle.ts` calls `shutdownMitmProxy()` on `SIGTERM`/`SIGINT` before the browser pool shutdown, so in-flight connections drain.
+- **MITM proxy port + CA volume in docker-compose**: `8192:8192` port mapping, `MITM_PROXY_*` env vars, and a persistent `trawl_proxy_ca` volume so the CA survives container restarts.
+- **Proxy tests**: header sanitization, response policy, adaptive streaming, challenge caching, direct HTTP forwarding, Range/206 handling, chunked responses, compressed challenge detection, and explicit media streaming.
+- **Proxy documentation**: architecture, configuration, client setup, and CA installation guides for operating systems, browsers, Java/JDownloader, containers, and application-specific trust stores.
+
+### Changed
+- `packages/types/src/index.ts` — `ScrapeResult` extended additively with optional `body`, `responseHeaders`, and `contentType`; native `/scrape` consumers should tolerate these additional fields.
+- `apps/api/src/proxy/server.ts` — `fetchRaw`/`reissue` replaced by `proxyRequest()` (Tier 0 with `scrape()` fallback) for both CONNECT-based HTTPS and plain HTTP traffic.
+- `lifecycle.ts` — `registerLifecycleHandlers()` accepts an optional `{ onShutdown }` callback.
+- `apps/api/src/index.ts` — captures the proxy handle on startup and wires it into `registerLifecycleHandlers`.
+- All application and internal package versions bumped to `1.2.0`.
+
+## [1.1.0] - 2026-07-22
+
+### Added
+- **Browser-backed MITM forward-proxy mode** (`MITM_PROXY_ENABLED`, off by default): HTTP(S) forward proxy that re-issues requests through the browser pool so clients like Prowlarr, Jackett, JDownloader, and changedetection.io can hit fingerprint-bound Cloudflare sites that the `/v1` cookie handoff cannot. The generated root CA is persisted, per-host certificates are minted in memory, and the root is downloadable at `GET /proxy-ca.crt`. New env: `MITM_PROXY_{ENABLED,PORT,HOST,CA_DIR,MAX_TIER,DEBUG}`.
+
+### Changed
+- `fetchRaw` rotates `proxyPool` on Cloudflare challenge (same `markBad → next()` pattern as Tier 3) instead of retrying on the same IP.
+- Main MITM proxy listener supports a configurable bind address through `MITM_PROXY_HOST`.
+- `ci.yml` runs on PRs targeting `dev` in addition to `main`.
+- `publish.yml` inspects the actually-pushed tag from `docker/metadata-action` instead of re-deriving from `github.sha` (which previously mismatched the 7-char short SHA).
+- `node-forge ^1.3.1` runtime dep for CA + per-host leaf cert generation.
+
+## [1.0.1] - 2026-07-18
+
+### Changed
+- `packages/browser/src/pool.ts` — renamed Firefox prefs key from `prefs` (silently ignored by camoufox-js@0.11.1) to `firefox_user_prefs` (which camoufox-js maps to Playwright's `firefoxUserPrefs`). The prefs are now actually applied.
+- `packages/browser/src/pool.ts` — added the safe-only subset of Firefox prefs: telemetry off (`datareporting.*`, `toolkit.telemetry.*`, `app.crashreporter`, `breakpad.*`), dead UI features off (`extensions.screenshots.*`, `browser.sessionstore.max_tabs_undo`), dead network services off (`browser.safebrowsing.*`, `extensions.update.*`, `browser.fixup.alternate.*`, `app.normandy.*`, `app.shield.*`, `network.connectivity-service.*`, `network.captive-portal-service.*`, `network.prefetch-next`, `beacon.enabled`), `security.OCSP.enabled: 0`, and tightened network timeouts (`tls-handshake-timeout: 30`, `connection-timeout: 60`, `response.timeout: 120`). None of these touch the JS/CSS fingerprint surface.
+- `apps/api/Dockerfile` — stage-3 prune of apt cache + `/usr/share/{locale,doc,man}` (image-size win, runtime-neutral).
+- `apps/api/Dockerfile` — added 9 Bun runtime ENV flags (`BUN_DISABLE_CJS=1`, `BUN_DEBUG=0`, `BUN_DISABLE_SOURCEMAPS=1`, `BUN_HTTP_KEEPALIVE=0`, `BUN_AGENT_DISABLE=1`, `BUN_INSPECT=0`, `BUN_LOCKFILE_MIGRATION=false`, `MIMALLOC_PURGE_DELAY=0`, `NODE_NO_WARNINGS=1`). All verified runtime-neutral in smoke tests.
+- `packages/browser/package.json` — moved `patchright` + `playwright-core` from `dependencies` to `devDependencies` (build hygiene; camoufox-js bundles both transitively at runtime).
+- All packages bumped to `1.0.1`.
+
+### Added
+- `scripts/bench-targets.sh`, `scripts/bench-success-rate.sh`, `scripts/bench-compare.sh` — observability harnesses for measuring CF challenge latency + bypass success rate.
 ## [1.0.0] - 2026-07-10
 
 ### Changed

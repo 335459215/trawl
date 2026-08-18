@@ -4,7 +4,8 @@ import type { Cookie, ScrapeRequest, ScrapeResult, SessionData, TierResult } fro
 import { runTier1 } from "./tiers/1"
 import { runTier2 } from "./tiers/2"
 import { runTier3 } from "./tiers/3"
-import { runTier4 } from "./tiers/4"
+// Tier 4 (residential proxy) is dynamically imported only when needed.
+import type { runTier4 } from "./tiers/4"
 import { normalizeHtml } from "./utils/html"
 import type { ProxyPool } from "./utils/proxyRotator"
 import { requireContentTypeForBody, sanitizeHeaders } from "./utils/sanitize"
@@ -26,18 +27,10 @@ export class ScrapeError extends Error {
   }
 }
 
-// True when a Tier 3/4 result indicates the browser's profile was actively rejected
-// by the upstream (CF / Imperva / etc.). On these outcomes the orchestrator flags the
-// pool for a future recycle; on every other outcome (success, transient error, timeout)
-// the browser is kept warm so cookies + cf_clearance survive.
-export function shouldFlagForRecycle(status: TierResult["status"]): boolean {
-  return status === "blocked" || status === "needs-js"
-}
-
 export interface OrchestratorDeps {
-  acquireBrowser(domain: string): Promise<BrowserHandle>
-  releaseBrowser(id: number): void
-  loadSession(domain: string): Promise<SessionData | null>
+  acquireBrowser(domain: string, budgetMs?: number): Promise<BrowserHandle>
+  releaseBrowser(id: number, lease?: number): void
+  loadSession(domain: string): Promise<SessionData | undefined>
   saveSession(domain: string, data: SessionData): Promise<void>
   invalidateSession(domain: string): Promise<void>
   proxyPool?: ProxyPool
@@ -52,6 +45,9 @@ const extractDomain = (url: string): string => {
     return url
   }
 }
+
+const hasUsablePayload = (result: { status: TierResult["status"]; html?: string; body?: Uint8Array }): boolean =>
+  result.status === "success" && (result.body !== undefined || Boolean(result.html))
 
 export async function scrape(req: ScrapeRequest, deps: OrchestratorDeps): Promise<ScrapeResult> {
   const totalStart = Date.now()
@@ -72,13 +68,13 @@ export async function scrape(req: ScrapeRequest, deps: OrchestratorDeps): Promis
   if (!req.skipHttp && maxTier >= 1) {
     const t1 = await runTier1(req.url, sanitizedHeaders, req.method, req.body)
     emit(t1)
-    if (t1.status === "success" && t1.html !== undefined) {
+    if (hasUsablePayload(t1)) {
       // Tier 1 doesn't acquire a browser (it's a plain HTTP fetch). Use a random fingerprint
       // UA from the pool so even Tier 1 requests don't share a single signature.
       const tier1UA = FINGERPRINT_POOL[Math.floor(Math.random() * FINGERPRINT_POOL.length)].userAgent
       return {
-        url: req.url,
-        html: normalizeHtml(t1.html),
+        url: t1.effectiveUrl ?? req.url,
+        html: normalizeHtml(t1.html ?? ""),
         cookies: [],
         userAgent: tier1UA,
         statusCode: t1.statusCode ?? 200,
@@ -87,6 +83,9 @@ export async function scrape(req: ScrapeRequest, deps: OrchestratorDeps): Promis
         timings,
         totalMs: Date.now() - totalStart,
         proxyUsed: false,
+        body: t1.body,
+        responseHeaders: t1.responseHeaders,
+        contentType: t1.contentType,
       }
     }
   }
@@ -96,7 +95,9 @@ export async function scrape(req: ScrapeRequest, deps: OrchestratorDeps): Promis
   }
 
   // Acquire browser for tiers 2-4
-  const handle = await deps.acquireBrowser(domain)
+  // Pass our own budget so the pool's stall detector doesn't reclaim this browser
+  // while the request is still inside the time the caller asked for.
+  const handle = await deps.acquireBrowser(domain, Math.max(maxTimeout - (Date.now() - totalStart), 0))
 
   try {
     // Tier 2: browser with cached session
@@ -105,7 +106,7 @@ export async function scrape(req: ScrapeRequest, deps: OrchestratorDeps): Promis
       const remaining = maxTimeout - (Date.now() - totalStart)
       const t2 = await runTier2(req.url, handle, session, remaining, sanitizedHeaders, req.method, req.body)
       emit(t2)
-      if (t2.status === "success" && t2.html !== undefined) {
+      if (hasUsablePayload(t2)) {
         if (t2.cookies && t2.cookies.length > 0) {
           await deps.saveSession(domain, {
             cookies: t2.cookies,
@@ -114,8 +115,8 @@ export async function scrape(req: ScrapeRequest, deps: OrchestratorDeps): Promis
           })
         }
         return {
-          url: req.url,
-          html: normalizeHtml(t2.html),
+          url: t2.effectiveUrl ?? req.url,
+          html: normalizeHtml(t2.html ?? ""),
           cookies: t2.cookies ?? [],
           userAgent: session.userAgent,
           statusCode: t2.statusCode ?? 200,
@@ -125,6 +126,9 @@ export async function scrape(req: ScrapeRequest, deps: OrchestratorDeps): Promis
           totalMs: Date.now() - totalStart,
           captchasSolved: t2.captchasSolved,
           proxyUsed: false,
+          body: t2.body,
+          responseHeaders: t2.responseHeaders,
+          contentType: t2.contentType,
         }
       }
       // Session failed — purge it
@@ -146,14 +150,6 @@ export async function scrape(req: ScrapeRequest, deps: OrchestratorDeps): Promis
       const remaining3 = maxTimeout - (Date.now() - totalStart)
       t3 = await runTier3(req.url, handle, remaining3, proxy3, sanitizedHeaders, req.method, req.body)
 
-      // Only flag the pool for a recycle when the upstream actively rejected the
-      // browser's profile ("blocked"/"needs-js"). Successful solves preserve cookies,
-      // cf_clearance, and TLS fingerprint — recycling after success would force a
-      // costly cold start on the next request to the same domain.
-      if (shouldFlagForRecycle(t3.status)) {
-        handle.noteTemporaryContext?.(`tier3 ${t3.status}`)
-      }
-
       const pool = deps.proxyPool
       if (t3.status !== "blocked" || req.proxy || !proxy3 || !pool || attempt + 1 >= MAX_PROXY_ATTEMPTS) break
       pool.markBad(proxy3)
@@ -165,7 +161,7 @@ export async function scrape(req: ScrapeRequest, deps: OrchestratorDeps): Promis
       proxy3 = next
     }
     emit(t3)
-    if (t3.status === "success" && t3.html !== undefined) {
+    if (hasUsablePayload(t3)) {
       const cookies: Cookie[] = t3.cookies ?? []
       if (cookies.length > 0) {
         await deps.saveSession(domain, {
@@ -175,8 +171,8 @@ export async function scrape(req: ScrapeRequest, deps: OrchestratorDeps): Promis
         })
       }
       return {
-        url: req.url,
-        html: normalizeHtml(t3.html),
+        url: t3.effectiveUrl ?? req.url,
+        html: normalizeHtml(t3.html ?? ""),
         cookies,
         userAgent: t3.userAgent ?? FINGERPRINT.userAgent,
         statusCode: t3.statusCode ?? 200,
@@ -186,6 +182,9 @@ export async function scrape(req: ScrapeRequest, deps: OrchestratorDeps): Promis
         totalMs: Date.now() - totalStart,
         captchasSolved: t3.captchasSolved,
         proxyUsed: Boolean(proxy3),
+        body: t3.body,
+        responseHeaders: t3.responseHeaders,
+        contentType: t3.contentType,
       }
     }
 
@@ -204,16 +203,11 @@ export async function scrape(req: ScrapeRequest, deps: OrchestratorDeps): Promis
     }
 
     let t4: Awaited<ReturnType<typeof runTier4>>
+    const { runTier4: runTier4Lazy } = await import("./tiers/4")
     for (let attempt = 0; ; attempt++) {
       console.log(`[orchestrator] Tier 4 via residential proxy: ${proxy4.replace(/\/\/[^@]*@/, "//**@")}`)
       const remaining4 = maxTimeout - (Date.now() - totalStart)
-      t4 = await runTier4(req.url, handle, remaining4, proxy4, sanitizedHeaders, req.method, req.body)
-
-      // Mirror Tier 3's recycle-on-suspect policy — only flag when the upstream
-      // explicitly rejected the browser's profile.
-      if (shouldFlagForRecycle(t4.status)) {
-        handle.noteTemporaryContext?.(`tier4 ${t4.status}`)
-      }
+      t4 = await runTier4Lazy(req.url, handle, remaining4, proxy4, sanitizedHeaders, req.method, req.body)
 
       const pool = deps.residentialProxyPool
       if (t4.status !== "blocked" || req.proxy || !pool || attempt + 1 >= MAX_PROXY_ATTEMPTS) break
@@ -223,7 +217,7 @@ export async function scrape(req: ScrapeRequest, deps: OrchestratorDeps): Promis
       proxy4 = next
     }
     emit(t4)
-    if (t4.status === "success" && t4.html !== undefined) {
+    if (hasUsablePayload(t4)) {
       const cookies: Cookie[] = t4.cookies ?? []
       if (cookies.length > 0) {
         await deps.saveSession(domain, {
@@ -233,8 +227,8 @@ export async function scrape(req: ScrapeRequest, deps: OrchestratorDeps): Promis
         })
       }
       return {
-        url: req.url,
-        html: normalizeHtml(t4.html),
+        url: t4.effectiveUrl ?? req.url,
+        html: normalizeHtml(t4.html ?? ""),
         cookies,
         userAgent: t4.userAgent ?? FINGERPRINT.userAgent,
         statusCode: t4.statusCode ?? 200,
@@ -244,11 +238,14 @@ export async function scrape(req: ScrapeRequest, deps: OrchestratorDeps): Promis
         totalMs: Date.now() - totalStart,
         captchasSolved: t4.captchasSolved,
         proxyUsed: true,
+        body: t4.body,
+        responseHeaders: t4.responseHeaders,
+        contentType: t4.contentType,
       }
     }
 
     throw new ScrapeError(`All tiers exhausted. Last failure: ${t4.reason ?? t4.status}`, timings)
   } finally {
-    deps.releaseBrowser(handle.id)
+    deps.releaseBrowser(handle.id, handle.lease)
   }
 }

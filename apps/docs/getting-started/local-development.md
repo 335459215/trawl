@@ -36,7 +36,7 @@ This downloads the browser into the local cache. It only needs to run once per m
 ## 3. Start Redis
 
 ```bash
-docker run -d --name trawl-redis -p 6379:6379 redis:8.8-alpine
+docker run -d --name trawl-redis -p 6379:6379 redis:8.8.1-alpine
 ```
 
 Or use any Redis-protocol-compatible server you already have.
@@ -94,8 +94,7 @@ trawl/
 │   └── tiers/       Tier 1–4 executors + orchestrator
 ├── docker-compose.yml          scraper + Redis (default)
 ├── docker-compose.minimal.yml  scraper only, no Redis
-├── docker-compose.prod.yml     production with restart + healthcheck
-└── docker-compose.full.yml     full stack including web + docs
+└── docker-compose.prod.yml     production with restart + healthcheck
 ```
 
 ## Cross-package TypeScript

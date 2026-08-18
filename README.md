@@ -7,19 +7,21 @@
 
 ## **Welcome** to <a href="https://trawl.germondai.com" target="_blank">**TRAWL**</a>! 👋
 
-Self-hosted web scraping engine that bypasses any JS challenge & captcha.\
-Support for: Cloudflare, Turnstile, Interstitial, reCAPTCHA, hCaptcha, GeeTest, Imperva (experimental).\
+Self-hosted web scraping engine with best-effort JS challenge and CAPTCHA solving.\
+Dedicated flows for Cloudflare, Akamai Bot Manager, and Imperva/Incapsula (best effort), plus Turnstile, reCAPTCHA, hCaptcha, and GeeTest.\
 Much faster and more reliable FlareSolverr & Byparr alternative and drop-in replacement for your \*arr stack.
 
 ## Features
 
 - **2-6x faster** - compared to FlareSolverr or Byparr it returns much faster with higher success rate
-- **4-tier execution** - plain HTTP fetch → cached browser session → fresh CF solve → residential proxy
+- **4-tier execution** - plain HTTP fetch → cached browser session → fresh challenge solve → residential proxy
+- **Challenge-aware HTTP/HTTPS proxy** - direct forwarding for normal traffic, automatic tier escalation for detected walls, plus WebSockets, binary bodies, and Range/206 support
+- **Multi-WAF handling** - dedicated Cloudflare, Akamai Bot Manager, and Imperva/Incapsula detection and browser flows
 - **Native captcha solving** - CF Turnstile/Interstitial, reCAPTCHA v2 (free STT), hCaptcha, GeeTest v4 Slide
-- **Camoufox Firefox** - fingerprint-patched at the C++/Juggler level; indistinguishable from a real browser
-- **Session cache** - bypass cookies stored in Redis; repeat requests to the same domain return in ~500ms
+- **Camoufox Firefox** - fingerprint-patched at the C++/Juggler level to reduce automation signals
+- **Session cache** - solved cookies and browser identity stored in Redis; accepted sessions can avoid a fresh solve
 - **FlareSolverr compatible** - works with Prowlarr, Jackett, Sonarr, and the full \*arr ecosystem out of the box
-- **No external APIs required** - reCAPTCHA audio transcription uses Google's free STT endpoint by default
+- **No paid solver API required** - reCAPTCHA audio can use Google's free STT endpoint or an optional local Whisper service
 
 ## Sponsors
 
@@ -85,6 +87,19 @@ curl http://localhost:8191/health
 
 First boot takes 15–30s while the browser pool warms up. Subsequent starts are fast.
 
+### NAS app catalogs
+
+Prefer a one-click installation? TRAWL is available from the community app
+catalogs for both TrueNAS and Unraid:
+
+- [TrueNAS Community Apps](https://apps.truenas.com/catalog/trawl_community/) —
+  open **Apps → Discover Apps** and search for **TRAWL**.
+- [Unraid Community Apps](https://ca.unraid.net/apps/trawl-1o4q23p06utr4h) —
+  open the **Apps** tab and search for **Trawl**.
+
+Thanks to the TrueNAS and Unraid community contributors who packaged and
+published these integrations.
+
 ## API
 
 ### FlareSolverr-compatible (`/v1`)
@@ -114,6 +129,171 @@ http://localhost:8191        # running on the same host
 http://trawl:8191            # running via Docker Compose on the same network
 ```
 
+### Challenge-bypassing HTTP/HTTPS proxy
+
+Some sites bind their Cloudflare clearance to the solving browser's full connection
+fingerprint. The `/v1` flow can't help there: Prowlarr keeps only the cookie + user-agent
+and **re-fetches the page with its own HTTP client**, which Cloudflare re-challenges — the
+cookie isn't portable. For those indexers, enable TRAWL's forward proxy and add it to
+Prowlarr as an **HTTP proxy**:
+
+```env
+MITM_PROXY_ENABLED=true
+MITM_PROXY_PORT=8192
+MITM_PROXY_CA_DIR=/data/proxy-ca   # persist the CA (mount a volume)
+MITM_PROXY_MAX_TIER=4              # cap escalation (e.g. 3 to stay off residential)
+```
+
+By default the listener binds `0.0.0.0` so clients on a Docker bridge network can reach
+it; set `MITM_PROXY_HOST=127.0.0.1` to restrict it to loopback on a bare-metal host.
+
+1. Install the proxy's CA into the client's trust store so it accepts the per-host certs:
+   `curl http://<trawl-host>:8191/proxy-ca.crt` → add to the Prowlarr container's CA store
+   (e.g. a linuxserver `/custom-cont-init.d` script that copies it to
+   `/usr/local/share/ca-certificates/` and runs `update-ca-certificates`).
+2. Prowlarr → Settings → Indexer Proxies → **HTTP**, host `<trawl-host>`, port `8192`.
+   Give it a tag if only selected indexers should use it.
+
+Ordinary requests use a direct HTTP/TLS path. Small HTML, JSON, and text responses are buffered
+for challenge detection; detected challenges escalate through the same tier pipeline as
+`POST /scrape`. Videos and large binary responses stream directly. Range requests are forwarded
+end to end and can escalate when their response is a detected challenge; WebSocket upgrades use a
+direct relay without browser escalation.
+
+See the complete [proxy documentation](./apps/docs/proxy/overview.md) for routing details,
+supported traffic, limitations, CA installation, and client examples.
+
+> ⚠️ A MITM proxy can impersonate any host to a client that trusts its CA. Only expose it on a
+> private interface (localhost / a private Docker network), never publicly.
+
+### Installing the proxy CA certificate
+
+The proxy self-generates a root CA on first run. Its certificate and private key are persisted
+under `MITM_PROXY_CA_DIR` (default `/data/proxy-ca`). Per-host certificates are minted and cached
+in memory while TRAWL runs; they do not need separate installation because they are signed by the
+persistent root. Every client that uses the proxy must trust that root. Without it, HTTPS fails with
+`ERR_CERT_AUTHORITY_INVALID` (browsers) or `PKIX path building failed` (Java).
+
+Download the CA once per client:
+
+```bash
+curl http://<trawl-host>:8191/proxy-ca.crt -o trawl-ca.crt
+# or in a Docker setup where the API isn't reachable from outside:
+docker cp trawl:/data/proxy-ca/ca.crt ./trawl-ca.crt
+```
+
+#### macOS (system keychain — affects most apps including Safari, curl, wget)
+
+```bash
+sudo security add-trusted-cert -d -r trustRoot \
+  -k /Library/Keychains/System.keychain ./trawl-ca.crt
+# Verify
+security find-certificate -c "TRAWL MITM Proxy CA"
+# Remove later
+sudo security delete-certificate -c "TRAWL MITM Proxy CA" \
+  /Library/Keychains/System.keychain
+```
+
+#### Linux (Debian/Ubuntu — system-wide for curl, wget, apt, etc.)
+
+```bash
+sudo cp trawl-ca.crt /usr/local/share/ca-certificates/trawl-ca.crt
+sudo update-ca-certificates
+# Verify
+awk '/BEGIN/{c++} c==2' /etc/ssl/certs/ca-certificates.crt | grep -c "TRAWL MITM"
+```
+
+#### Linux (RHEL/Fedora/Amazon)
+
+```bash
+sudo cp trawl-ca.crt /etc/pki/ca-trust/source/anchors/trawl-ca.crt
+sudo update-ca-trust
+```
+
+#### Firefox and NSS trust stores
+
+Firefox installations that do not use operating-system roots need a per-profile NSS import:
+
+```bash
+# Firefox 115+ uses a file-backed NSS DB; older versions use the legacy libnssdb format.
+# The certutil command is the same either way.
+certutil -A -n "TRAWL MITM" -t "CT,C,C" -i trawl-ca.crt \
+  -d sql:$HOME/.mozilla/firefox/<profile-dir>
+# Or via Firefox UI: Settings → Privacy & Security → Certificates → View Certificates →
+# Authorities → Import… → check "Trust this CA to identify websites".
+# Profile dir location: about:profiles in Firefox.
+```
+
+#### Chrome / Chromium (Linux: separate from system trust)
+
+Chrome uses the system trust store on macOS and Windows but has its own on Linux:
+
+```bash
+# Option A: launch Chrome with --user-data-dir + NSS DB update (same as Firefox).
+# Option B: use Chrome's --ignore-certificate-errors-spki-list=<hash> (per-session, less safe).
+# Option C: add the cert to the system store (above) — Chrome picks it up automatically on
+# most Linux distros via the nss-tool lookup.
+```
+
+#### Java (including JDownloader)
+
+```bash
+# Find the JRE cacerts file for your client.
+#   JDownloader:    <install>/jre/lib/security/cacerts
+keytool -importcert -alias trawl -file trawl-ca.crt \
+  -keystore "<path-to-cacerts>" -storepass changeit
+# If `keytool` reports "Certificate already exists in keystore", use -delete first:
+#   keytool -delete -alias trawl -keystore "<path-to-cacerts>" -storepass changeit
+```
+
+Prowlarr, Sonarr, and Radarr are .NET applications, not Java applications. For their
+**Docker-based installations**, add the CA to the container's Linux system trust store. A common
+LinuxServer pattern is a `/custom-cont-init.d` script:
+
+```yaml
+# In the client's Compose service:
+volumes:
+  - ./trawl-ca.crt:/config/trawl-ca.crt:ro
+  - ./install-trawl-ca.sh:/custom-cont-init.d/50-install-trawl-ca:ro
+```
+
+```bash
+#!/usr/bin/with-contenv bash
+cp /config/trawl-ca.crt /usr/local/share/ca-certificates/trawl-ca.crt
+update-ca-certificates
+```
+
+LinuxServer runs scripts in `/custom-cont-init.d/` when the container starts. Java clients such as
+JDownloader require the separate `keytool` import described above.
+
+#### JDownloader 2 (Windows / macOS / Linux — manual install)
+
+JDownloader bundles its own JRE; the CA must be imported into it.
+
+1. Find the JRE: `Settings → Advanced → Java Path` (in JDownloader) or look in the install dir:
+   - Windows: `C:\Program Files\JDownloader 2\jre\lib\security\cacerts`
+   - macOS: `/Applications/JDownloader 2.app/Contents/app/jre/lib/security/cacerts`
+   - Linux: `<install>/jre/lib/security/cacerts`
+2. Run the `keytool -importcert` command above against that file.
+3. Restart JDownloader.
+
+#### Windows (system trust store)
+
+```powershell
+# Run PowerShell as Administrator.
+Import-Certificate -FilePath .\trawl-ca.crt `
+  -CertStoreLocation Cert:\LocalMachine\Root
+# Remove later
+Get-ChildItem Cert:\LocalMachine\Root | Where-Object { $_.Subject -like "*TRAWL MITM*" } | Remove-Item
+```
+
+#### Removing the CA (cleanup)
+
+Every installation method has a symmetric removal path. Search your trust store for
+`TRAWL MITM Proxy CA` (the CA's CN) and delete that entry. The CA certificate and key also live at
+`<MITM_PROXY_CA_DIR>/ca.crt` and `ca.key` on the TRAWL host. Deleting either causes TRAWL to
+generate a new root on its next start, so existing clients must install the new certificate.
+
 ## Tiers
 
 ```
@@ -126,7 +306,7 @@ Tier 1: Plain HTTP fetch ────── success ──→ return (< 100ms)
 Tier 2: Cached session ─────── success ──→ return (~500ms)
   │ cache miss / expired
   ▼
-Tier 3: Fresh CF solve ─────── success ──→ cache + return (4–15s)
+Tier 3: Fresh challenge solve ─ success ──→ cache + return
   │ IP flagged
   ▼
 Tier 4: Residential proxy ──── success ──→ cache + return (15–45s)
@@ -142,7 +322,6 @@ Tier 4: Residential proxy ──── success ──→ cache + return (15–45
 | `docker-compose.yml`         | Scraper + Redis (default)                                |
 | `docker-compose.minimal.yml` | Scraper only, no Redis                                   |
 | `docker-compose.prod.yml`    | Production: `restart: always`, memory limit, healthcheck |
-| `docker-compose.full.yml`    | Full stack: scraper + web + docs                         |
 
 ## Docker images (one GHCR package, two tags)
 
@@ -161,7 +340,7 @@ image: ghcr.io/germondai/trawl:latest
 image: ghcr.io/germondai/trawl:baseline
 ```
 
-Synology note: many Synology NAS units (DSM 7.x on J4125 / older hardware) ship kernel 4.4.x, which Bun's modern runtime can't fully handle. Standard Bun requires kernel 5.1+ (5.6+ recommended); the baseline build degrades gracefully down to kernel 3.10. The `:baseline` tag is published for that case — **confirmed working** on a Synology DS920+ (Celeron J4125, DSM 7.3.2, kernel 4.4.302): the container starts cleanly, `/health` reports healthy, and it solves live Cloudflare challenges via `/v1` (see [#1](https://github.com/germondai/trawl/issues/1)). Published by independent GitHub Actions workflows (`.github/workflows/publish.yml`, `publish-baseline.yml`); tag-triggered releases push matching git tags (e.g. `v1.0.0` → `1.0.0`, `1.0.0-baseline` → `1.0.0-baseline`) and manual `workflow_dispatch` from `main` updates the rolling tag (`latest` and `baseline` respectively).
+Synology note: many Synology NAS units (DSM 7.x on J4125 / older hardware) ship kernel 4.4.x, which Bun's modern runtime can't fully handle. Standard Bun requires kernel 5.1+ (5.6+ recommended); the baseline build degrades gracefully down to kernel 3.10. The `:baseline` tag is published for that case — **confirmed working** on a Synology DS920+ (Celeron J4125, DSM 7.3.2, kernel 4.4.302): the container starts cleanly, `/health` reports healthy, and it solves live Cloudflare challenges via `/v1` (see [#1](https://github.com/germondai/trawl/issues/1)). Published by independent GitHub Actions workflows: pushing `v1.4.0` creates `:1.4.0`, `:latest`, `:1.4.0-baseline`, and `:baseline`; pushing `main` creates `:nightly` and `:nightly-<sha>`.
 
 ## Releases & versioning
 
@@ -183,17 +362,46 @@ git push origin v1.0.1
 
 ## Configuration
 
+TRAWL supports HTTP proxies, authenticated HTTP proxies, and SOCKS5 proxies. The standard Compose
+files read proxy settings from the local `.env` file:
+
+```ini
+# Optional Tier 3 datacenter proxy
+PROXY_URL=http://user:pass@datacenter.example.com:8080
+
+# Optional Tier 4 residential proxy
+RESIDENTIAL_PROXY_URL=socks5://user:pass@residential.example.com:1080
+```
+
+```bash
+docker compose up -d
+```
+
+Leave either value empty to disable that proxy tier. Multiple endpoints can be separated with
+commas; larger pools can use the corresponding `*_LIST_FILE` variable. See
+[Configuration → Proxies](./apps/docs/getting-started/configuration.md#proxies)
+for pool and mounted-file examples.
+
 | Variable                         | Default                  | Description                                                                         |
 | -------------------------------- | ------------------------ | ----------------------------------------------------------------------------------- |
 | `BROWSER_POOL_SIZE`              | `3`                      | Warm Camoufox Firefox instances                                                     |
 | `BROWSER_ACQUIRE_TIMEOUT_MS`     | `15000`                  | How long `acquire()` polls for a free browser before HTTP 429 is returned           |
-| `BROWSER_RECYCLE_AFTER_CONTEXTS` | `8`                      | Recycle a browser after this many `blocked`/`needs-js` outcomes; set `0` to disable |
+| `BROWSER_RECYCLE_AFTER_CONTEXTS` | `8`                      | Rolling-replace after this many Tier 3/4 contexts; set `0` to disable               |
 | `BROWSER_CONTENT_PROCESSES`      | `2`                      | Cap Firefox content processes per browser (`dom.ipc.processCount`); lowers RAM/CPU  |
 | `SESSION_TTL_SECONDS`            | `3600`                   | Redis session cache TTL (seconds)                                                   |
 | `REDIS_URL`                      | `redis://localhost:6379` | Redis connection string                                                             |
+| `PROXY_URL`                      | —                        | Optional Tier 3 HTTP or SOCKS5 proxy, or comma-separated pool                       |
+| `PROXY_LIST_FILE`                | —                        | File containing one Tier 3 proxy URL per line                                       |
 | `RESIDENTIAL_PROXY_URL`          | —                        | Enables Tier 4 proxy escalation                                                     |
+| `RESIDENTIAL_PROXY_LIST_FILE`    | —                        | File containing one Tier 4 proxy URL per line                                       |
 | `STT_URL`                        | —                        | Local Whisper endpoint for reCAPTCHA (optional)                                     |
 | `PORT`                           | `8191`                   | API listen port                                                                     |
+| `MITM_PROXY_ENABLED`             | `false`                  | Enable the challenge-bypassing HTTP/HTTPS proxy                                     |
+| `MITM_PROXY_PORT`                | `8192`                   | Forward-proxy listen port                                                           |
+| `MITM_PROXY_HOST`                | `0.0.0.0`                | Bind address; `127.0.0.1` for loopback-only                                         |
+| `MITM_PROXY_CA_DIR`              | `/data/proxy-ca`         | Persistent root CA certificate and private-key directory                            |
+| `MITM_PROXY_MAX_TIER`            | `4`                      | Cap escalation used by the proxy (e.g. `3` to stay off residential)                 |
+| `MITM_PROXY_DEBUG`               | `false`                  | Log one line per proxied request (errors are always logged)                         |
 
 ## Stack
 
